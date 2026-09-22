@@ -175,7 +175,14 @@ export function classifyEvent(obj: unknown, seq: number): AgyEvent | undefined {
     const inner = r && typeof r === 'object' ? r : {}
     const cid = pick(inner, ['conversation_id', 'conversationId'])
     const status = pick(inner, ['status'])
-    const response = pick(inner, ['structured_output', 'response', 'text', 'content'])
+    // `response` may be a string (plain-text turns) while `structured_output`
+    // carries the JSON envelope as an OBJECT (agy >=1.6 with --json-schema).
+    // Read them separately: stringifying the object into `response` would let
+    // the envelope reach the text channel and the CANCELED/empty-response
+    // guards would miscount. The optional pass-through keeps `structured_output`
+    // intact for the tool-bridge layer.
+    const structured = inner.structured_output ?? inner.structuredOutput
+    const response = pick(inner, ['response', 'text', 'content'])
     const error = pick(inner, ['error', 'error_message', 'errorMessage'])
     const ok = status === undefined ? !error : String(status).toUpperCase() !== 'ERROR'
     return {
@@ -183,9 +190,10 @@ export function classifyEvent(obj: unknown, seq: number): AgyEvent | undefined {
       conversationId: typeof cid === 'string' ? cid : '',
       ok,
       response: typeof response === 'string' ? response : '',
+      ...(structured !== undefined && structured !== null ? { structuredOutput: structured } : {}),
       ...(typeof error === 'string' ? { error } : {}),
       usage: parseUsage(inner.usage),
-    };
+    }
   }
 // Shape inference for schemas without an event discriminator.
   if (o.usage && typeof o.usage === 'object' && (o.status !== undefined || o.response !== undefined)) {

@@ -250,6 +250,13 @@ export interface ResultEvent {
   conversationId: string
   ok: boolean
   response: string
+  /**
+   * Raw structured answer from `result.structured_output` (agy >=1.6 with
+   * `--json-schema`): the tool-bridge envelope arrives here as an OBJECT,
+   * while `response` stays empty. Kept untyped-unknown because the parser is
+   * shape-agnostic — the bridge layer validates it (see parseToolBridgeAnswer).
+   */
+  structuredOutput?: unknown
   error?: string
   usage: RawUsage
 }

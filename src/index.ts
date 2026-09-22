@@ -26,6 +26,7 @@ import { poolWithQuotaErrors } from './server/admin-api.ts'
 import { GatewaySemaphore } from './server/semaphore.ts'
 import { installShutdown } from './server/shutdown.ts'
 import { AdminEventBus } from './server/events.ts'
+import * as gatewayPatch from './patch/gateway-patch.ts'
 import { openDb } from './server/db.ts'
 import { KeyStore, loadOrCreateMasterKey } from './server/key-store.ts'
 import { UsageLedger } from './server/usage-ledger.ts'
@@ -201,6 +202,16 @@ async function main(): Promise<void> {
   // B4/S4: the pool's corrupt-file quarantine and throttled persist warnings
   // ride the log seam instead of vanishing into console silence.
   const pool = new AccountPoolManager(undefined, (m) => log.warn({ src: 'pool' }, redactLine(m)))
+  // gateway-patch CRITICAL (charter): admin DELETE /admin/pool/accounts/:id
+  // rm -rf's account.dir (pool.ts deleteAccount) — refuse the boot when any
+  // pool dir escapes /root/.agy-accounts (symlink or .. traversal included),
+  // so the reachable-by-HTTP delete surface can never erase server material
+  // outside the pool. See src/patch/gateway-patch.ts validateAccountDirs().
+  const dirGuard = gatewayPatch.validateAccountDirs({ accounts: pool.getPoolData().accounts })
+  if (!dirGuard.ok) {
+    log.error({ reason: dirGuard.reason }, 'gateway refused to start: unsafe account dir in pool.json')
+    process.exit(1)
+  }
   const quota = new QuotaService(pool)
   const poolAuth = new PoolAuthFlow(pool, quota, (m) => log.warn({ src: 'pool-auth' }, redactLine(m)))
   pool.sweepStaleStaging()

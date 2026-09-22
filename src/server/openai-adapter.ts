@@ -70,6 +70,39 @@ export function newCompletionId(): string {
 
 // ---- request mapping -------------------------------------------------------
 
+/**
+ * Phase 3 tool-bridge: assistant turns may carry tool_calls from a previous
+ * gateway turn (the client replays the whole conversation). They are read
+ * leniently into the EngineMessage so the bridge conversation view can show
+ * the model which functions were already requested — a malformed entry is
+ * dropped (it is context, not a request), never a 400.
+ */
+function readAssistantToolCalls(raw: unknown): OpenAiToolCall[] | undefined {
+  if (!Array.isArray(raw) || raw.length === 0) return undefined
+  const out: OpenAiToolCall[] = []
+  for (const entry of raw) {
+    if (entry === null || typeof entry !== 'object') continue
+    const e = entry as Record<string, unknown>
+    const fn = e.function
+    if (fn === null || typeof fn !== 'object') continue
+    const f = fn as Record<string, unknown>
+    const name = typeof f.name === 'string' ? f.name : undefined
+    if (name === undefined || name === '') continue
+    const args = typeof f.arguments === 'string' && f.arguments.trim() !== '' ? f.arguments : '{}'
+    const id = typeof e.id === 'string' && e.id !== '' ? e.id : 'call_replayed'
+    out.push({ id, type: 'function', function: { name, arguments: args } })
+  }
+  return out.length > 0 ? out : undefined
+}
+
+/** Tool-bridge call ids minted by this gateway (`call_` + 24 hex chars). */
+const BRIDGE_CALL_ID_RE = /^call_[0-9a-f]{24}$/
+
+/** Whether a tool_call_id names a tool-bridge call of ours. */
+export function isBridgeCallId(callId: string): boolean {
+  return BRIDGE_CALL_ID_RE.test(callId)
+}
+
 function bad(message: string): GatewayHttpError {
   return httpError(400, message, 'invalid_request_error', 'invalid_request')
 }
@@ -277,17 +310,23 @@ export async function mapChatRequest(
     if (role === 'assistant') {
       // Assistant turns carrying tool_calls are kept as foreign context turns:
       // the engine's digest treats unmarked assistant text as history agy has
-      // not seen. (Our own mirror round trips arrive as role:'tool' below.)
+      // not seen. Tool calls ride along for the tool-bridge conversation view
+      // (the model must see which functions a previous turn already asked
+      // for); under the native mirror path they are inert context.
       const text = contentToText(m.content, 'assistant')
-      messages.push({ role: 'assistant', text })
+      const toolCalls = readAssistantToolCalls(m.tool_calls)
+      messages.push({ role: 'assistant', text, ...(toolCalls !== undefined ? { toolCalls } : {}) })
       continue
     }
     if (role === 'tool') {
-      // A tool result is meaningful only as the continuation cursor of one of
-      // OUR mirrored agy tool calls (engine detects the agytc- run/step id).
+      // A tool result is meaningful as the continuation cursor of one of OUR
+      // mirrored agy tool calls (agytc- run/step id), or — Phase 3 — as the
+      // result of a tool-bridge call the client just executed (call_… id).
+      // A foreign id (another provider's call) stays rejected: the gateway
+      // cannot know what it was.
       const callId = typeof m.tool_call_id === 'string' ? m.tool_call_id : undefined
-      if (callId === undefined || parseMirrorCallId(callId) === null) {
-        throw bad('tool messages are only accepted as continuations of this gateway\'s own tool calls (agytc- cursor)')
+      if (callId === undefined || (parseMirrorCallId(callId) === null && !isBridgeCallId(callId))) {
+        throw bad('tool messages are only accepted as continuations of this gateway\'s own tool calls (agytc-/call_ cursor)')
       }
       messages.push({ role: 'tool', text: contentToText(m.content, 'tool'), toolCallId: callId })
       continue
@@ -396,12 +435,29 @@ export async function mapChatRequest(
     warnings.push('metadata/user/safety_identifier are logged context only — never forwarded upstream')
   }
 
+  // Client tool definitions (Phase 3 tool-bridge): function-shaped tools are
+  // handed to the engine, which packs them + the conversation into one agy
+  // prompt and unpacks the structured answer into OpenAI tool_calls. The
+  // mirror-native tool (agy_tool) is NOT a client tool — it stays on the
+  // native mirror path (the engine filters it out of the bridge set), so a
+  // client that followed the mirror contract keeps working unchanged.
+  let clientTools: import('../patch/tool-bridge.ts').OpenAiFunctionTool[] | undefined
+  if (Array.isArray(b.tools) && b.tools.length > 0) {
+    clientTools = b.tools as import('../patch/tool-bridge.ts').OpenAiFunctionTool[]
+    warnings.push('client tools are executed by the CALLER through the tool-calls bridge (agy never runs them)')
+  }
+  if (b.tool_choice !== undefined && clientTools === undefined) {
+    warnings.push('tool_choice without tools has no effect')
+  }
+
   const call: EngineCall = {
     model,
     messages,
     ...(effort !== undefined ? { reasoningEffort: effort } : {}),
     ...(system !== undefined ? { system } : {}),
     ...(jsonSchema !== undefined ? { jsonSchema } : {}),
+    ...(clientTools !== undefined ? { tools: clientTools } : {}),
+    ...(b.tool_choice !== undefined ? { toolChoice: b.tool_choice } : {}),
   }
   // stream_options.include_usage: the usage frame rides the end of the SSE
   // stream (choices:[]) instead of the body.
@@ -543,6 +599,11 @@ export function assembleCompletion(args: {
     function: { name: t.name, arguments: t.arguments },
   }))
   const content = text === '' && toolCalls.length > 0 ? null : text
+  // OpenAI contract: finish_reason is 'tool_calls' whenever the turn carries
+  // tool calls. The engine already reports tool-calls for every path that
+  // produces them (mirror tool steps AND the Phase 3 tool-bridge recut), so
+  // this only guards against a stop-marked span that still shipped calls.
+  const effectiveKind = kind === 'stop' && toolCalls.length > 0 ? 'tool-calls' : kind
   return {
     id,
     object: 'chat.completion',
@@ -556,7 +617,7 @@ export function assembleCompletion(args: {
           content,
           ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
         },
-        finish_reason: finishReasonOf(kind),
+        finish_reason: finishReasonOf(effectiveKind),
         logprobs: null,
       },
     ],

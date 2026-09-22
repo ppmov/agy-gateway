@@ -199,8 +199,10 @@ describe('mapChatRequest', () => {
       ],
     })
     expect(call.messages[1]).toEqual({ role: 'assistant', text: 'a' })
-    // M2: an assistant turn carrying tool_calls is accepted as history
-    // context (the tool_calls array itself is not forwarded — only text).
+    // M2 + Phase 3: an assistant turn carrying tool_calls is accepted as
+    // history context. The calls ride along on the EngineMessage for the
+    // tool-bridge conversation view (the model must see what it already
+    // asked for); they are never forwarded as agy tools.
     const withTc = await map({
       ...BASE,
       messages: [
@@ -208,10 +210,14 @@ describe('mapChatRequest', () => {
         { role: 'user', content: 'go on' },
       ],
     })
-    expect(withTc.call.messages[0]).toEqual({ role: 'assistant', text: '' })
+    expect(withTc.call.messages[0]).toEqual({
+      role: 'assistant',
+      text: '',
+      toolCalls: [{ id: 'c', type: 'function', function: { name: 'f', arguments: '{}' } }],
+    })
   })
 
-  it('accepts tool results only with our agytc- cursor', async () => {
+  it('accepts tool results with our agytc- mirror cursor or a bridge call_ id', async () => {
     const { call } = await map({
       ...BASE,
       messages: [
@@ -220,9 +226,24 @@ describe('mapChatRequest', () => {
       ],
     })
     expect(call.messages[1]).toEqual({ role: 'tool', text: 'out', toolCallId: 'agytc-run1-3' })
+    // Phase 3: a tool-bridge call id (call_ + 24 hex, our own mint shape) is
+    // accepted — that is how a client returns a function result.
+    const bridge = await map({
+      ...BASE,
+      messages: [
+        { role: 'user', content: 'q' },
+        { role: 'tool', content: '{"temp":5}', tool_call_id: 'call_' + '0'.repeat(24) },
+      ],
+    })
+    expect(bridge.call.messages[1]).toEqual({ role: 'tool', text: '{"temp":5}', toolCallId: 'call_' + '0'.repeat(24) })
+    // Foreign / malformed ids stay rejected.
     mapThrows({
       ...BASE,
       messages: [{ role: 'tool', content: 'out', tool_call_id: 'call_abc123' }],
+    }, /agytc-/)
+    mapThrows({
+      ...BASE,
+      messages: [{ role: 'tool', content: 'out', tool_call_id: 'call_NOTHEX_NOTHEX_NOTHEX_NOTHEX' }],
     }, /agytc-/)
     mapThrows({
       ...BASE,

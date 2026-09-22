@@ -21,3 +21,5 @@ Source basis:
 Fixture: events.ndjson replays a lone ERROR result envelope; case.json
 sets `fakeAgyExitCode: 1` (test/fake-agy.mjs FAKE_AGY_EXIT_CODE hook) so
 the replay reproduces real agy's exit-1 semantics for a failed request.
+
+- 2026-09-22 ppmov gateway-patch: engine message now carries the CLIProxyAPI 429-classifier kind suffix "(soft_retry)" etc. — expected.json updated to match.

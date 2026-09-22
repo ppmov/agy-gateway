@@ -239,6 +239,13 @@ export interface RunOptions {
   /** stdin stays writable (auth code injection). */
   keepStdin?: boolean
   /**
+   * Payload written to stdin right after spawn, then stdin is closed. Used by
+   * the Phase 3 tool-bridge: the prompt rides as one NDJSON `{event:'user'}`
+   * line (`--input-format stream-json`) instead of a `-p <prompt>` argv value,
+   * which also removes the ARG_MAX/E2BIG ceiling on long prompts.
+   */
+  stdinData?: string
+  /**
    * POSIX-only: how long a SIGTERM'd process group gets to exit before the
    * kill ladder escalates to SIGKILL (A-H1). Windows ignores it — taskkill /F
    * is already fatal. Defaults to GRACE_MS.
@@ -318,7 +325,17 @@ export function startAgyProcess(opts: RunOptions): RunningProcess {
   // 1.1.15: `agy models` hangs forever with an open pipe stdin, which is
   // why model discovery silently timed out). Close stdin immediately for
   // every spawn that does not explicitly need to write to it.
-  if (!opts.keepStdin) {
+  if (opts.stdinData !== undefined) {
+    // Phase 3 tool-bridge: one NDJSON user event, then EOF. The write is
+    // awaited via the stream's own callback; a failed write (child already
+    // gone) must not crash the handler — it surfaces as a spawn/exit error.
+    try {
+      child.stdin?.write(opts.stdinData)
+      child.stdin?.end()
+    } catch {
+      // ignore — the outcome promise reports the child's fate
+    }
+  } else if (!opts.keepStdin) {
     try {
       child.stdin?.end()
     } catch {

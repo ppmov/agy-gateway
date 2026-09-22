@@ -46,6 +46,11 @@
 // sequences through this hook. FAKE_AGY_EXIT_CODE (default 0) sets the exit
 // code of the replay, so upstream-failure goldens (oa8b) reproduce the real
 // silent-failure shape: ERROR envelope on stdout + exit 1 + empty stderr.
+// FAKE_AGY_EVENTS_FILES (Phase 3 tool-bridge retry drill): a comma-separated
+// list of event files; spawn N replays entry N (the last entry repeats for
+// further spawns), so attempt 1 can answer badly and the retry well. The
+// index comes from FAKE_AGY_EVENTS_SEQ_FILE (default: <tmpdir>/agy-fake-seq),
+// a counter file the fake bumps per start — no parent-side coordination.
 // FAKE_AGY_FAIL_HOME makes the hard rate-limit branch fire ONLY when the
 // spawned process HOME (USERPROFILE on win32) equals it — the 429 auto-switch
 // drill fails account A while account B keeps serving ok runs.
@@ -67,7 +72,7 @@
 // process.env once per run). Unreadable/missing file falls back to
 // FAKE_AGY_MODE; when the file is set both are re-read here, file wins.
 
-import { appendFileSync, readFileSync } from 'node:fs'
+import { appendFileSync, readFileSync, writeFileSync } from 'node:fs'
 
 const argv = process.argv.slice(2)
 let mode = process.env.FAKE_AGY_MODE ?? 'ok'
@@ -234,6 +239,27 @@ if (process.env.FAKE_AGY_EVENTS_FILE) {
     for (const line of lines) process.stdout.write(line + '\n')
   } catch {}
   process.exit(Number(process.env.FAKE_AGY_EXIT_CODE ?? '0'))
+}
+
+// Phase 3 retry drill: a comma-separated event-file list, one entry per spawn
+// (the last repeats). The spawn counter lives in FAKE_AGY_EVENTS_SEQ_FILE (or
+// a tmpdir default), bumped atomically enough for sequential spawn drills.
+if (process.env.FAKE_AGY_EVENTS_FILES) {
+  const entries = process.env.FAKE_AGY_EVENTS_FILES.split(',').map((s) => s.trim()).filter(Boolean)
+  if (entries.length > 0) {
+    const seqFile = process.env.FAKE_AGY_EVENTS_SEQ_FILE
+    let n = 0
+    if (seqFile) {
+      try { n = Number(readFileSync(seqFile, 'utf8').trim()) || 0 } catch { n = 0 }
+      try { writeFileSync(seqFile, String(n + 1)) } catch {}
+    }
+    const pick = entries[Math.min(n, entries.length - 1)]
+    try {
+      const lines = readFileSync(pick, 'utf8').split('\n').filter((l) => l.trim() !== '')
+      for (const line of lines) process.stdout.write(line + '\n')
+    } catch {}
+    process.exit(Number(process.env.FAKE_AGY_EXIT_CODE ?? '0'))
+  }
 }
 
 if (mode === 'auth') {

@@ -33,7 +33,24 @@ import { defaultMediaDir, stageImages, type ImageRefLike } from './media.ts'
 import { isolatedHomeEnv, sanitizeChildEnv, startAgyProcess, type RunOutcome } from './runner.ts'
 import { dataDir, stateDir } from '../common/config.ts'
 import type { SessionStore } from './sessions.ts'
-import type { StreamChunk, TokenUsage } from './stream-types.ts'
+import { CallId, type StreamChunk, type TokenUsage } from './stream-types.ts'
+import * as gatewayPatch from '../patch/gateway-patch.ts'
+import { MIRROR_TOOL_NAME } from './mirror.ts'
+import {
+  buildToolBridgePrompt,
+  buildToolBridgeResponseSchema,
+  maxToolBridgeAttempts,
+  needsToolBridgeFollowUp,
+  parseToolBridgeAnswer,
+  isRetryableToolBridgeError,
+  resolveToolBridgePolicy,
+  TOOL_BRIDGE_MAX_RETRIES,
+  ToolBridgeError,
+  type OpenAiFunctionTool,
+  type OpenAiToolCall,
+  type ToolBridgeMessage,
+  type ToolBridgeResult,
+} from '../patch/tool-bridge.ts'
 
 /** Engine failure with a stable routing code (maps 1:1 onto the Err table). */
 export class EngineError extends Error {
@@ -118,6 +135,13 @@ export interface EngineMessage {
   /** For role='tool': callId of the mirrored agy tool call this answers. */
   toolCallId?: string
   /**
+   * Phase 3 tool-bridge: for role='assistant', the client-visible tool calls
+   * that opened the turn. Carried into the bridge conversation view so the
+   * model sees which functions were already requested (argument text stays a
+   * JSON string — never re-parsed as data).
+   */
+  toolCalls?: readonly OpenAiToolCall[]
+  /**
    * Provider that produced an assistant turn. Multi-model gateway sessions
    * mark foreign replies so the digest keeps their turns; unmarked assistant
    * messages are treated as foreign (agy's native history lacks them).
@@ -136,6 +160,16 @@ export interface EngineCall {
   sessionKey?: string
   /** JSON schema enforcing the final result (--json-schema). */
   jsonSchema?: unknown
+  /**
+   * Phase 3 tool-bridge: client function definitions (OpenAI `tools[]`).
+   * When present, the bridge takes over the prompt (definitions + conversation
+   * packed into one agy prompt, envelope `--json-schema`) and the recut layer
+   * unpacks the model's JSON answer into OpenAI `message.tool_calls`. See
+   * src/patch/tool-bridge.ts.
+   */
+  tools?: readonly OpenAiFunctionTool[]
+  /** OpenAI tool_choice ('auto' | 'none' | 'required' | {function:{name}}). */
+  toolChoice?: unknown
   /** Per-call image byte reader; wins over deps.readImage (request-scoped). */
   readImage?: (ref: ImageRefLike) => Promise<Uint8Array | null>
   /**
@@ -282,6 +316,136 @@ interface SpanEnd {
 /** Gateway provider id; assistant turns marked with it rode OUR agy history. */
 const PROVIDER_ID = 'antigravity'
 
+/**
+ * Phase 3 tool-bridge recut: replace the RAW agy turn with the OpenAI-shaped
+ * one. `rec` is the run recording; `events.slice(from)` are the events the raw
+ * span streamed (all mapped chunks were buffered, nothing reached the client).
+ *
+ * Success → the chunks `block-start/text/text-delta/block-end … usage/finish`
+ * with `finish.reason.kind='tool-calls'` when the model asked for functions.
+ * Failure → a terminal error chunk (`invalid_output`, 502-class) — an answer
+ * without structure is NEVER a silent 200.
+ */
+function* recutToolBridgeSpan(
+  rec: RunRecording,
+  rawOverride: string | Record<string, unknown> | undefined,
+  policy: ReturnType<typeof resolveToolBridgePolicy>,
+  model: string,
+): Generator<StreamChunk> {
+  const raw = rawOverride ?? lastResultResponse(rec, 0)
+  const failure = (message: string): StreamChunk[] => [
+    { type: 'usage', usage: { inputTokens: 0, outputTokens: 0 } },
+    { type: 'finish', reason: { kind: 'error', failure: { message, code: Err.INVALID_OUTPUT } } },
+  ]
+
+  if (raw === undefined) {
+    // No result envelope: the run failed upstream (quota/auth/process/empty).
+    // Surfacing NOTHING here would produce an empty 200 — the exact silent
+    // success the bridge must never return. Prefer the recording's own
+    // failure (it carries the real cause + routing code); otherwise report
+    // the missing structure.
+    const f = rec.failureInfo
+    if (f !== null) {
+      yield { type: 'usage', usage: { inputTokens: 0, outputTokens: 0 } }
+      yield { type: 'finish', reason: f.kind === 'aborted' ? { kind: 'aborted', failure: { message: f.message, code: f.code } } : { kind: 'error', failure: { message: f.message, code: f.code } } }
+      return
+    }
+    yield* failure('tool bridge: agy produced no usable answer (no result envelope)')
+    return
+  }
+
+  let turn: ToolBridgeResult
+  try {
+    turn = parseToolBridgeAnswer(raw, policy, model)
+  } catch (err) {
+    yield* failure(err instanceof ToolBridgeError ? err.message : 'tool bridge: ' + brief(String(err)))
+    return
+  }
+
+  const usage: TokenUsage = usageFromRaw(rec.finalUsage(rec.getResultRawUsage() ?? {}))
+  let idx = 0
+  if (turn.content !== '') {
+    yield { type: 'block-start', index: idx, blockType: 'text' }
+    yield { type: 'text-delta', index: idx, text: turn.content }
+    yield { type: 'block-end', index: idx, block: { type: 'text', text: turn.content } }
+    idx++
+  }
+  for (const call of turn.toolCalls) {
+    yield { type: 'block-start', index: idx, blockType: 'tool-call' }
+    yield {
+      type: 'block-end',
+      index: idx,
+      block: { type: 'tool-call', id: CallId(call.id), name: call.function.name, arguments: call.function.arguments },
+    }
+    idx++
+  }
+  yield { type: 'usage', usage }
+  yield {
+    type: 'finish',
+    reason: turn.toolCalls.length > 0 ? { kind: 'tool-calls' } : { kind: 'stop' },
+  }
+}
+
+/** The last result envelope's answer among `events[from..]`: the structured
+ *  envelope object (agy >=1.6 `result.structured_output`, preferred when the
+ *  bridge schema is in play) or the plain `response` text. */
+function lastResultResponse(rec: RunRecording, from: number): string | Record<string, unknown> | undefined {
+  for (let i = rec.length - 1; i >= from; i--) {
+    const ev = rec.eventAt(i)
+    if (ev === undefined || ev.kind !== 'result') continue
+    if (ev.structuredOutput !== undefined && ev.structuredOutput !== null) {
+      return typeof ev.structuredOutput === 'string'
+        ? ev.structuredOutput
+        : (ev.structuredOutput as Record<string, unknown>)
+    }
+    if (ev.response.trim() !== '') return ev.response
+  }
+  return undefined
+}
+
+/**
+ * Phase 3 tool-bridge retry loop: when the recut failed on a STRUCTURED
+ * shape problem, ask agy up to TOOL_BRIDGE_MAX_RETRIES more times (a fresh
+ * spawn on the same prompt) before the client sees anything — retries stay
+ * invisible by construction (the raw chunks were buffered, only the final
+ * recut is emitted). Returns the successful raw answer or the last error; the
+ * recording keeps the LAST attempt only when it produced a usable answer, so
+ * the caller can recut from the fresh events.
+ */
+async function respawnForToolBridge(
+  engine: AgyEngine,
+  rec: RunRecording,
+  policy: ReturnType<typeof resolveToolBridgePolicy>,
+  model: string,
+  family: ModelFamily,
+  firstRaw: string | Record<string, unknown> | undefined,
+): Promise<string | Record<string, unknown> | undefined> {
+  let raw = firstRaw
+  const isBlank = (v: string | Record<string, unknown> | undefined): boolean => typeof v === 'string' && v.trim() === ''
+  for (let attempt = 0; attempt < TOOL_BRIDGE_MAX_RETRIES; attempt++) {
+    let parsed: ToolBridgeResult | undefined
+    let err: unknown
+    try {
+      parsed = raw === undefined || isBlank(raw)
+        ? undefined
+        : parseToolBridgeAnswer(raw, policy, model)
+    } catch (e) {
+      err = e
+    }
+    if (parsed !== undefined) return raw
+    // An EMPTY answer is the probabilistic headless shape too (agy burned the
+    // turn on an auto-denied native tool and finished with an empty response
+    // while reporting SUCCESS): retry it exactly like a broken envelope, so
+    // the client gets a real attempt instead of an immediate 502.
+    const emptyAnswer = raw !== undefined && isBlank(raw)
+    if (raw === undefined || (!emptyAnswer && !isRetryableToolBridgeError(err))) return raw
+    const fresh = await engine.respawnToolBridgeAttempt(rec, family)
+    if (fresh === undefined) return raw
+    raw = fresh
+  }
+  return raw
+}
+
 function isForeignAssistant(m: EngineMessage): boolean {
   if (m.role !== 'assistant') return false
   return m.provider !== PROVIDER_ID
@@ -290,6 +454,39 @@ function isForeignAssistant(m: EngineMessage): boolean {
 function sawAuthFailure(parser: StreamJsonParser, outcome: { stderrTail: string; stdout: string }): boolean {
   if (parser.stats.sawAuthFailure) return true
   return looksLikeAuthFailure(outcome.stderrTail) || looksLikeAuthFailure(outcome.stdout.slice(0, 4000))
+}
+
+/**
+ * Project the engine's message list into the tool-bridge conversation view.
+ * Assistant turns keep their tool calls (so the model sees what it already
+ * asked for), tool turns keep the answered call id, and any client tool
+ * result that arrived WITHOUT the mirror-native `role:'tool'` shape is folded
+ * into an explicit `[tool result …]` user turn — otherwise a client that
+ * follows its own continuation shape would dead-end against the gateway's
+ * mirror-cursor rule.
+ */
+export function toolBridgeMessages(messages: readonly EngineMessage[]): ToolBridgeMessage[] {
+  const out: ToolBridgeMessage[] = []
+  for (const m of messages) {
+    if (m.role === 'tool') {
+      out.push({
+        role: 'tool',
+        text: m.text,
+        ...(m.toolCallId !== undefined ? { toolCallId: m.toolCallId } : {}),
+      })
+      continue
+    }
+    if (m.role === 'assistant') {
+      out.push({
+        role: 'assistant',
+        text: m.text,
+        ...(m.toolCalls !== undefined ? { toolCalls: m.toolCalls } : {}),
+      })
+      continue
+    }
+    out.push({ role: m.role, text: m.text })
+  }
+  return out
 }
 
 /** Rolling digest of turns this agy conversation has not seen (ADR-7). */
@@ -335,6 +532,19 @@ export class AgyEngine {
    *  the busy filter filtered nothing. */
   private readonly busyAccounts = new Set<string>()
   private readonly inFlightCount = new Map<string, number>()
+  /**
+   * Phase 3 tool-bridge retry restart info: the argv/env/cwd of the LAST
+   * bridge spawn so respawnToolBridgeAttempt() can re-run the SAME prompt
+   * once when the model's answer had no usable structure. Cleared by the
+   * non-bridge path so a retry can never replay an unrelated call.
+   */
+  private bridgeRestart: { args: string[]; env: NodeJS.ProcessEnv; cwd: string; stdinData?: string; signal?: AbortSignal } | undefined
+  /**
+   * Live agy child processes spawned by this engine. The tool-bridge retry
+   * must never add a second concurrent process, and the per-request busy MARK
+   * is not a usable proxy (it is held by the very request doing the retry).
+   */
+  private liveAgyChildren = 0
 
   constructor(private readonly deps: EngineDeps) {}
 
@@ -640,6 +850,27 @@ export class AgyEngine {
       prompt = 'System instructions:\n' + call.system + '\n\n' + prompt;
     }
 
+    // ---- Phase 3 tool-bridge: client function calling ----
+    // The client's own tools[] are NOT forwarded as agy tools. Instead the
+    // definitions + the whole conversation are packed into ONE prompt and the
+    // structured answer is requested through --json-schema (see
+    // src/patch/tool-bridge.ts). The JSON envelope reaches `recut()` below,
+    // which unpacks it into OpenAI tool_calls. A client that already has
+    // mirror-native tool definitions is left on the native loop (parallel_tool
+    // tools like agy_tool) — the bridge only serves function-shaped tools.
+    const bridgeTools = (call.tools ?? []).filter((t) => t.function?.name !== MIRROR_TOOL_NAME)
+    let bridgePolicy: ReturnType<typeof resolveToolBridgePolicy> | null = null
+    if (bridgeTools.length > 0 || call.toolChoice !== undefined) {
+      bridgePolicy = resolveToolBridgePolicy(bridgeTools, call.toolChoice, toolBridgeMessages(messages))
+      if (bridgePolicy.allowedNames.length > 0 || bridgePolicy.tools.length > 0) {
+        prompt = buildToolBridgePrompt(bridgePolicy, toolBridgeMessages(messages), call.system)
+      } else {
+        // tool_choice:'none' — nothing to offer; keep the plain prompt and let
+        // the model answer as text.
+        bridgePolicy = null
+      }
+    }
+
     // ---- multimodal staging: images ride as staged files ----
     let stagedDirs: string[] = []
     const imageRefs: ImageRefLike[] = []
@@ -722,15 +953,80 @@ export class AgyEngine {
         extraArgs: cfg.extraArgs,
         addDirs: stagedDirs,
       })
-      // --json-schema: write the schema to a temp file and append the argv tail
-      // (absorbed from upstream oneshot.ts schemaArgs so /v1 endpoints can use
-      // structured output without the oneshot machinery).
-      if (call.jsonSchema !== undefined && call.jsonSchema !== null) {
+      // Phase 3 tool-bridge: the bridge turn is a pure text→JSON conversion.
+      // Two structural differences from a normal one-shot (both verified live
+      // against agy 1.6.5 and mirrored from the star-cliproxy reference
+      // tool-bridge-provider.buildAgyArgs):
+      //  1. The prompt rides stdin as ONE NDJSON `{event:'user'}` event
+      //     (`--input-format stream-json`) instead of a `-p <prompt>` argv
+      //     value — same transport the reference uses, and it lifts the
+      //     ARG_MAX/E2BIG ceiling off long prompts.
+      //  2. The envelope schema is passed INLINE (`--json-schema '<json>'`),
+      //     not as a temp file. With `-p`+file the model burned its turn on a
+      //     native run_command (denied headless) and returned
+      //     response:"" with no structured_output; the stdin+inline-schema
+      //     form returns the envelope in result.structured_output.
+      // `--sandbox` keeps native tools structurally off as a second guard.
+      let stdinData: string | undefined
+      if (bridgePolicy !== null && bridgePolicy.allowedNames.length > 0) {
+        const envelopeSchema = gatewayPatch.sanitizeOutgoingSchema(
+          call.jsonSchema !== undefined && call.jsonSchema !== null
+            ? call.jsonSchema
+            : buildToolBridgeResponseSchema(bridgePolicy),
+        )
+        // Rebuild the argv for stream-json: drop the `-p <prompt>` pair the
+        // shared builder appended, drop any schema-file args already added.
+        const stripped: string[] = []
+        for (let i = 0; i < args.length; i++) {
+          const a = args[i]
+          if (a === '-p' || a === '--print') {
+            i++ // skip the prompt value that follows
+            continue
+          }
+          if (a === '--json-schema') {
+            i++ // skip the schema-file path that follows
+            continue
+          }
+          if (a === '--input-format' || a === '--output-format') {
+            i++ // rewritten below
+            continue
+          }
+          stripped.push(a as string)
+        }
+        args = [
+          '--input-format', 'stream-json',
+          '--output-format', 'stream-json',
+          '--json-schema', JSON.stringify(envelopeSchema),
+          ...stripped,
+          '--sandbox',
+        ]
+        stdinData = JSON.stringify({ event: 'user', message: { role: 'user', content: prompt } }) + '\n'
+      }
+      // A client-supplied jsonSchema on a NON-bridge request keeps the file
+      // form (unchanged upstream behavior).
+      if (bridgePolicy === null && call.jsonSchema !== undefined && call.jsonSchema !== null) {
         const dir = await mkdtemp(join(tmpdir(), 'agy-schema-'))
         const file = join(dir, 'schema.json')
-        await writeFile(file, JSON.stringify(call.jsonSchema), 'utf8')
+        // gateway-patch: CLIProxyAPI schema sanitizer — declaration/generation
+        // locations only; conversation history never passes through here
+        // (the -p prompt text carries it as prose, not as JSON schemas).
+        await writeFile(file, JSON.stringify(gatewayPatch.sanitizeOutgoingSchema(call.jsonSchema)), 'utf8')
         args.push('--json-schema', file)
         schemaCleanup = () => rm(dir, { recursive: true, force: true })
+      }
+      // Phase 3 tool-bridge: remember the exact spawn parameters so a retry
+      // can replay the SAME turn before the client sees the shape failure.
+      // (env is filled in below, once envFor() is defined.)
+      if (bridgePolicy !== null && bridgePolicy.allowedNames.length > 0) {
+        this.bridgeRestart = {
+          args: [...args],
+          env: {},
+          cwd: workspaceRoot,
+          ...(stdinData !== undefined ? { stdinData } : {}),
+          ...(call.signal !== undefined ? { signal: call.signal } : {}),
+        }
+      } else {
+        this.bridgeRestart = undefined
       }
       release = await this.deps.acquire(call.signal)
       if (call.signal?.aborted ?? false) {
@@ -877,10 +1173,14 @@ export class AgyEngine {
         this.deps.onParser?.(parser)
         const before = snapshotConversations(attemptAcc?.dir || undefined)
         let streamCid: string | null = null
+        // Phase 3 tool-bridge: the retry spawn must use the SAME account env
+        // (isolated HOME) as this attempt, not the server's process.env.
+        if (this.bridgeRestart !== undefined) this.bridgeRestart.env = envFor(attemptAcc)
         // The binary seam is re-read per attempt: a retry may find a
         // (re)installed binary even when attempt 0 failed to spawn.
         const attemptBin = this.deps.bin() ?? bin
         try {
+          this.liveAgyChildren++
           proc = startAgyProcess({
             bin: attemptBin,
             args: [...(this.deps.binArgs ?? []), ...args],
@@ -888,6 +1188,10 @@ export class AgyEngine {
             timeoutMs: cfg.timeoutMs,
             signal: call.signal,
             env: envFor(attemptAcc),
+            // Phase 3 tool-bridge: the prompt rides stdin as one NDJSON event
+            // when the bridge is active (see the argv rewrite above); the
+            // native path keeps the `-p <prompt>` argv and an empty stdin.
+            ...(this.bridgeRestart?.stdinData !== undefined ? { stdinData: this.bridgeRestart.stdinData } : {}),
             // A-M5: raw stdout chunks go straight into the parser — the old
             // onLine seam re-split every chunk into lines and re-appended
             // '\n' only for the parser to split them apart again, and the
@@ -902,6 +1206,7 @@ export class AgyEngine {
             },
           })
         } catch (e) {
+          this.liveAgyChildren--
           // startAgyProcess funnels spawn errors into the outcome promise
           // (child 'error' → code null); a synchronous throw is exceptional —
           // but it used to leave the recording unsettled forever. Normalize.
@@ -909,6 +1214,7 @@ export class AgyEngine {
         }
         if (steerKey !== '') this.activeRuns.set(steerKey, rec)
         const outcome = await proc.outcome
+        this.liveAgyChildren--
         if (this.activeRuns.get(steerKey) === rec) this.activeRuns.delete(steerKey)
         if (steerKey !== '') this.activeSessionPrompts.delete(steerKey)
         for (const ev of parser.flush()) {
@@ -949,7 +1255,14 @@ export class AgyEngine {
           failure = { kind: 'error', code: Err.VALIDATION_REQUIRED, message: url !== undefined ? detail + ' (validation_url: ' + url + ')' : detail }
         } else if (isRateLimit) {
           const bestMsg = parser.stats.lastResultError || (outcome.stderrTail ? brief(outcome.stderrTail) : 'Rate limit or quota reached')
-          failure = { kind: 'error', code: Err.AGY_ERROR, message: 'Google Antigravity quota / rate limit reached: ' + bestMsg }
+          // gateway-patch: CLIProxyAPI 429-classifier refines the blunt hard-limit
+          // signal — TODO(full integration): switch on gatewayPatch.decideEngineCooldown()
+          // kind to route instant_retry_same_auth / short_cooldown_switch_auth
+          // (<5m windows) through account switch instead of the blunt cooldown
+          // below; MVP keeps looksLikeHardRateLimit as the gate (not breaking
+          // the Sakiko15 pipeline — working-point patch only).
+          const d429 = gatewayPatch.classifyAgy429(bestMsg)
+          failure = { kind: 'error', code: Err.AGY_ERROR, message: 'Google Antigravity quota / rate limit reached (' + d429.kind + '): ' + bestMsg }
         } else if (!consumable) {
           if (outcome.code !== 0) {
             // agy reports its failure on STDOUT as a result envelope and often
@@ -1163,6 +1476,33 @@ export class AgyEngine {
       }
     })()
 
+    // ---- Phase 3 tool-bridge: buffered span + OpenAI recut ----
+    // With client tools in play the RAW agy turn must never reach the client
+    // (it is the JSON envelope, not an assistant message): every chunk is
+    // buffered, a shape failure is retried (up to TOOL_BRIDGE_MAX_RETRIES
+    // extra spawns) BEFORE anything is emitted, and only the recut — text +
+    // OpenAI tool_calls + finish_reason — is streamed downstream.
+    if (bridgePolicy !== null && bridgePolicy.allowedNames.length > 0) {
+      const buffered: StreamChunk[] = []
+      const rawSpan = this.driveSpan(rec, 0, true)
+      for (;;) {
+        const next = await rawSpan.next()
+        if (next.done === true) break
+        buffered.push(next.value)
+      }
+      void buffered
+      const raw = await respawnForToolBridge(this, rec, bridgePolicy, model, family, lastResultResponse(rec, 0))
+      for (const ch of recutToolBridgeSpan(rec, raw, bridgePolicy, model)) {
+        // Bridge turns never continue through the agy mirror cursor: the
+        // client's continuation comes back as tool messages, not as an
+        // agytc- callId, so the recording must not be retained.
+        if (ch.type === 'finish') rec.keepForContinuation = false
+        yield ch
+      }
+      if (rec.isSettled) this.deps.runs.forget(rec.runId)
+      return
+    }
+
     // First span of the run: stream recorded events until the first
     // completed tool step cuts it (or the result finishes it). The dispatch
     // loop above keeps the recording unsettled until the final attempt, so
@@ -1175,6 +1515,104 @@ export class AgyEngine {
     // keep flag so the settle-time check above retains it for continuation.
     rec.keepForContinuation = spanEnd.cutOnTool
     if (!rec.keepForContinuation && rec.isSettled) this.deps.runs.forget(rec.runId)
+  }
+
+  /**
+   * Phase 3 tool-bridge retry: one EXTRA spawn of the same agy call for a
+   * bridge turn whose answer had no usable structure, executed BEFORE the
+   * client sees anything. The fresh process appends into the SAME recording
+   * (one recording per logical run), so unmapped events just extend the log
+   * — the recut reads the last result envelope, which is the fresh answer.
+   * Returns that answer, or undefined when the retry could not run/failed
+   * (no pool account, spawn error, steer/abort): the caller then surfaces the
+   * original 502-class failure, never a silent success.
+   */
+  /** Wait (bounded) until no engine-spawned agy child is live. */
+  private async waitForIdleAgy(timeoutMs = 30_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs
+    while (this.liveAgyChildren > 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 25))
+    }
+  }
+
+  async respawnToolBridgeAttempt(rec: RunRecording, family: ModelFamily): Promise<string | Record<string, unknown> | undefined> {
+    if (rec.isSettled && rec.failureInfo !== null) {
+      // The run itself failed (quota/auth/process) — a retry would misreport
+      // the real cause as a tool-bridge shape problem.
+      return undefined
+    }
+    const cfg = this.deps.getConfig()
+    // One agy process at a time (charter §6 / task constraint): the busy MARK
+    // belongs to this very request, so it is not the guard — the live child
+    // counter is.
+    // The previous spawn's async completion may still be in flight (the
+    // recording settles as soon as the result envelope arrives, a beat before
+    // the child handler resumes) — WAIT for it to leave instead of skipping
+    // the retry, otherwise the shape failure reaches the client unretried.
+    await this.waitForIdleAgy()
+    const bridge = this.bridgeRestart
+    if (bridge === undefined) return undefined
+    const bin = this.deps.bin()
+    if (bin === null) return undefined
+    const account = this.deps.pool && this.deps.pool.getAccounts().length > 0
+      ? this.deps.pool.selectAccount(family, this.busyAccounts)
+      : undefined
+    try {
+      // Per-account serial queue (charter §6): the retry spawn must not
+      // interleave with another request on the same account.
+      const parser = new StreamJsonParser()
+      // The retry spawn owns its OWN answer: the recording may already be
+      // settled (append() is a no-op then), so the fresh result is captured
+      // here instead of being read back from the run log.
+      let freshResponse: string | Record<string, unknown> | undefined
+      const capture = (ev: { kind: string; response?: string; structuredOutput?: unknown }): void => {
+        if (ev.kind !== 'result') return
+        if (ev.structuredOutput !== undefined && ev.structuredOutput !== null) {
+          freshResponse = typeof ev.structuredOutput === 'string'
+            ? ev.structuredOutput
+            : (ev.structuredOutput as Record<string, unknown>)
+        } else if (ev.response !== undefined && ev.response.trim() !== '') {
+          freshResponse = ev.response
+        }
+      }
+      const spawn = async (): Promise<boolean> => {
+        this.liveAgyChildren++
+        try {
+          const proc = startAgyProcess({
+            bin,
+            // binArgs is the harness seam (node + fake-agy script); production
+            // leaves it empty. Dropping it here made the retry spawn a binary
+            // that cannot exist, silently killing the retry.
+            args: [...(this.deps.binArgs ?? []), ...bridge.args],
+            cwd: bridge.cwd,
+            timeoutMs: cfg.timeoutMs,
+            signal: bridge.signal,
+            env: bridge.env,
+            ...(bridge.stdinData !== undefined ? { stdinData: bridge.stdinData } : {}),
+            onChunk: (chunk) => {
+              for (const ev of parser.feed(chunk)) {
+                capture(ev)
+                rec.append(ev)
+              }
+            },
+          })
+          const outcome = await proc.outcome
+          for (const ev of parser.flush()) {
+            capture(ev)
+            rec.append(ev)
+          }
+          return outcome.code === 0
+        } finally {
+          this.liveAgyChildren--
+        }
+      }
+      const q = account != null ? this.accountQueues.get(account.id) : undefined
+      const ok = q !== undefined ? await q.add(spawn) : await spawn()
+      if (!ok || freshResponse === undefined) return undefined
+      return freshResponse
+    } catch {
+      return undefined
+    }
   }
 
   /**
