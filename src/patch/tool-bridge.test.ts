@@ -27,9 +27,12 @@ import { buildServer } from '../server/app.ts'
 import { buildLogger } from '../server/logger.ts'
 import { GatewaySemaphore } from '../server/semaphore.ts'
 import {
+  agyOverflowCause,
+  agyPromptOverflowError,
   buildToolBridgePrompt,
   buildToolBridgeResponseSchema,
   extractJsonObject,
+  isAgyPromptOverflow,
   isRetryableToolBridgeError,
   maxToolBridgeAttempts,
   newToolCallId,
@@ -411,6 +414,93 @@ describe('TB-UNIT: retry loop', () => {
     expect(isRetryableToolBridgeError(new ToolBridgeError('invalid_output', 'x'))).toBe(true)
     expect(isRetryableToolBridgeError(new ToolBridgeError('invalid_tools', 'x'))).toBe(false)
   })
+
+  it('never retries an overflow (same prompt can never fit)', () => {
+    expect(isRetryableToolBridgeError(new ToolBridgeError('prompt_overflow', 'prompt too long'))).toBe(false)
+    // Overflow-shaped raw text (engine-level rethrow without a code).
+    expect(isRetryableToolBridgeError(new Error('Input is too long: 2500000 tokens > 1048576 maximum'))).toBe(false)
+  })
+})
+
+describe('TB-UNIT: prompt overflow classification (Phase 4 fix A-1)', () => {
+  const policy = resolveToolBridgePolicy(TOOLS_BODY, undefined, [])
+
+  it('isAgyPromptOverflow matches the documented agy overflow signatures', () => {
+    expect(isAgyPromptOverflow('PROMPT_OVERFLOW: conversation too large')).toBe(true)
+    expect(isAgyPromptOverflow('Error: prompt is too long for this model')).toBe(true)
+    expect(isAgyPromptOverflow('request exceeds the maximum context length')).toBe(true)
+    expect(isAgyPromptOverflow('Input is too long: 2500000 tokens > 1048576 maximum')).toBe(true)
+    expect(isAgyPromptOverflow('Individual quota reached')).toBe(false)
+    expect(isAgyPromptOverflow('model overloaded')).toBe(false)
+  })
+
+  it('reclassifies a no-envelope overflow answer as a 413-class error (was a raw 502)', () => {
+    // The real shape: agy reports the failure INSTEAD of the JSON envelope.
+    try {
+      parseToolBridgeAnswer('Error: Input is too long: 2500000 tokens > 1048576 maximum', policy)
+      throw new Error('should have thrown')
+    } catch (e) {
+      expect(e).toBeInstanceOf(ToolBridgeError)
+      expect((e as ToolBridgeError).code).toBe('prompt_overflow')
+      expect((e as ToolBridgeError).status).toBe(413)
+      expect((e as ToolBridgeError).message).toContain('prompt too long for model context')
+      expect((e as ToolBridgeError).message).toContain('Input is too long')
+    }
+  })
+
+  it('reclassifies an {error} structured_output overflow object (no envelope keys)', () => {
+    expect(() =>
+      parseToolBridgeAnswer({ error: 'PROMPT_OVERFLOW: the request does not fit the model window' }, policy),
+    ).toThrow(expect.objectContaining({ code: 'prompt_overflow', status: 413 }))
+  })
+
+  it('keeps generic structureless answers at the 502 class', () => {
+    try {
+      parseToolBridgeAnswer('The weather in Moscow is 5 degrees, no tool needed.', policy)
+      throw new Error('should have thrown')
+    } catch (e) {
+      expect(e).toBeInstanceOf(ToolBridgeError)
+      expect((e as ToolBridgeError).code).toBe('invalid_output')
+      expect((e as ToolBridgeError).status).toBe(502)
+    }
+  })
+
+  it('prefers the envelope when the answer parses (overflow only on the no-structure path)', () => {
+    // A legit envelope that merely MENTIONS overflow in prose must not flip to 413.
+    const res = parseToolBridgeAnswer(
+      JSON.stringify({ content: 'The log said: prompt is too long', tool_calls: [] }),
+      policy,
+    )
+    expect(res.content).toBe('The log said: prompt is too long')
+    expect(res.finishReason).toBe('stop')
+  })
+
+  it('does not retry an overflow answer inside the retry loop', async () => {
+    let asks = 0
+    await expect(
+      withToolBridgeRetries('Error: prompt is too long for this model', policy, async () => {
+        asks++
+        return JSON.stringify({ content: 'ok', tool_calls: [] })
+      }),
+    ).rejects.toMatchObject({ code: 'prompt_overflow', status: 413 })
+    expect(asks).toBe(0) // terminal on the FIRST sight — no retry spawn
+  })
+
+  it('agyOverflowCause finds the cause in failure-channel texts, not in prose', () => {
+    expect(agyOverflowCause('Error: 429 RESOURCE_EXHAUSTED: Individual quota reached')).toBeUndefined()
+    expect(agyOverflowCause('agy exited with code 1: model overloaded')).toBeUndefined()
+    expect(agyOverflowCause('')).toBeUndefined()
+    expect(agyOverflowCause('   \n  ')).toBeUndefined()
+    const cause = agyOverflowCause('Error: Input is too long: 2500000 tokens > 1048576 maximum\n')
+    expect(cause).toBe('Error: Input is too long: 2500000 tokens > 1048576 maximum')
+  })
+
+  it('agyPromptOverflowError carries the verbatim agy text after the prefix', () => {
+    const err = agyPromptOverflowError('PROMPT_OVERFLOW: 1.2M tokens')
+    expect(err.code).toBe('prompt_overflow')
+    expect(err.status).toBe(413)
+    expect(err.message).toBe('prompt too long for model context: PROMPT_OVERFLOW: 1.2M tokens')
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -546,6 +636,44 @@ describe('TB-E2E: non-streaming', () => {
     const res = await postChat(s, chatPayload())
     expect(res.statusCode).toBe(502)
     expect(res.body).toContain('no structured answer')
+  })
+
+  it('overflow answer instead of the envelope → explicit "prompt too long" error, no retries (fix A-1)', async () => {
+    // agy reports "prompt too long" through the SAME no-envelope channel. The
+    // classified ToolBridgeError carries code='prompt_overflow'/status=413 and
+    // its message reaches the client verbatim (the HTTP status wiring lives in
+    // the engine recut — REPORT-fixA.md documents the 2-line residual); the
+    // regression this test pins: the cause is EXPLICIT (not a bare 502
+    // "no structured answer") and NO retry spawn burns on a prompt that can
+    // never fit (see the spawns assertion).
+    const dir = mkdtempSync(join(tmpdir(), 'agy-bridge-overflow-'))
+    const argsFile = join(dir, 'args.jsonl')
+    useEvents(bridgeEvents('Error: Input is too long: 2500000 tokens > 1048576 maximum'))
+    process.env.FAKE_AGY_ARGS_FILE = argsFile
+    const s = track(makeServer())
+    const res = await postChat(s, chatPayload())
+    delete process.env.FAKE_AGY_ARGS_FILE
+    // The engine recut wires the ToolBridgeError code through to HTTP:
+    // prompt_overflow → 413 (PROMPT_OVERFLOW row in errorStatus, was 502
+    // before the residual wiring landed — the same fix this test pins).
+    expect(res.statusCode).toBe(413)
+    const body = res.json() as { error?: { code?: string; message?: string } }
+    expect(body.error?.code).toBe('PROMPT_OVERFLOW')
+    expect(body.error?.message).toContain('prompt too long for model context')
+    expect(body.error?.message).toContain('Input is too long')
+    // Terminal on the FIRST sight: attempt 1 only, zero retry spawns.
+    const spawns = readFileSync(argsFile, 'utf8').split('\n').filter((l) => l.trim() !== '')
+    expect(spawns.length).toBe(1)
+  })
+
+  it('overflow on a STREAMING bridge request → SSE error frame with the prompt-too-long cause', async () => {
+    useEvents(bridgeEvents('Error: prompt is too long for this model'))
+    const s = track(makeServer())
+    const res = await postChat(s, chatPayload({ stream: true }))
+    expect(String(res.headers['content-type'])).toContain('text/event-stream')
+    expect(res.body).toContain('"error"')
+    expect(res.body).toContain('prompt too long for model context')
+    expect(res.body).not.toContain('tool_calls')
   })
 
   it('exit12 crash → not a bridge success (upstream failure surfaces)', async () => {

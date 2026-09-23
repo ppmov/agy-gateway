@@ -146,6 +146,45 @@ describe('mapChatRequest', () => {
     await expect(map({ ...BASE, model: undefined }, { ...cfg, defaultModel: 'fallback-m' })).resolves.toBeTruthy()
   })
 
+  it('Phase 4 fix A-2: whitespace-only user content → 400, not the engine 502', async () => {
+    mapThrows({ ...BASE, messages: [{ role: 'user', content: ' ' }] }, /whitespace-only/)
+    mapThrows({ ...BASE, messages: [{ role: 'user', content: '' }] }, /whitespace-only/)
+    mapThrows({ ...BASE, messages: [{ role: 'user', content: '\t\n ' }] }, /whitespace-only/)
+    const err = await mapChatRequest({ ...BASE, messages: [{ role: 'user', content: '   ' }] }, cfg).catch((e) => e)
+    expect(err).toBeInstanceOf(GatewayHttpError)
+    expect((err as GatewayHttpError).statusCode).toBe(400)
+  })
+
+  it('Phase 4 fix A-2: whitespace-only system/tool content → 400', async () => {
+    mapThrows({ ...BASE, messages: [{ role: 'system', content: '  ' }, { role: 'user', content: 'hi' }] }, /system message content/)
+    mapThrows({ ...BASE, messages: [{ role: 'developer', content: ' ' }, { role: 'user', content: 'hi' }] }, /developer message content/)
+    // tool results must be non-blank too — but the cursor rule runs first.
+    mapThrows(
+      { ...BASE, messages: [{ role: 'user', content: 'hi' }, { role: 'tool', content: '  ', tool_call_id: 'call_' + 'a'.repeat(24) }] },
+      /tool message content/,
+    )
+  })
+
+  it('Phase 4 fix A-2: legitimate blank shapes stay legal', async () => {
+    // An assistant turn with ONLY tool_calls (blank text) is the "called the
+    // function" shape a continuation request replays — must map cleanly.
+    const { call } = await map({
+      ...BASE,
+      messages: [
+        { role: 'user', content: 'weather?' },
+        { role: 'assistant', content: '', tool_calls: [{ id: 'call_' + 'a'.repeat(24), type: 'function', function: { name: 'get_weather', arguments: '{"city":"Moscow"}' } }] },
+        { role: 'tool', content: '{"temp":5}', tool_call_id: 'call_' + 'a'.repeat(24) },
+      ],
+    })
+    expect(call.messages).toHaveLength(3)
+    expect(call.messages[1]?.text).toBe('')
+    // An image-only user turn (blank text + image parts) is legitimate: the
+    // engine appends its own inspection prompt.
+    const pngB64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='
+    const mapped = await map({ ...BASE, messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,' + pngB64 } }] }] })
+    expect(mapped.call.messages[0]?.images).toHaveLength(1)
+  })
+
   it('joins system and developer messages in arrival order', async () => {
     const { call } = await map({
       ...BASE,

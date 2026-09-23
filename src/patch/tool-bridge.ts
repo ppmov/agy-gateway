@@ -118,9 +118,11 @@ export const EMPTY_ARGUMENTS = '{}'
 /**
  * Error codes for the tool bridge. They are mapped to HTTP by the route:
  * `invalid_output` → 502 (upstream produced something the gateway cannot
- * serve), `invalid_tools` → 400 (the CLIENT's tools[] is malformed).
+ * serve), `invalid_tools` → 400 (the CLIENT's tools[] is malformed),
+ * `prompt_overflow` → 413 (the CLIENT's prompt does not fit the model
+ * context — agy said so in its error text).
  */
-export type ToolBridgeErrorCode = 'invalid_output' | 'invalid_tools'
+export type ToolBridgeErrorCode = 'invalid_output' | 'invalid_tools' | 'prompt_overflow'
 
 /** Bridge failure carrying a stable code + the HTTP status the route uses. */
 export class ToolBridgeError extends Error {
@@ -133,8 +135,11 @@ export class ToolBridgeError extends Error {
     this.code = code
     // 502-class: the failure is on the upstream/structured-output side, not
     // the caller's request — the client must be able to tell "no answer" from
-    // "empty answer" (silent 200 was the Phase 3 defect).
-    this.status = code === 'invalid_tools' ? 400 : 502
+    // "empty answer" (silent 200 was the Phase 3 defect). Client-side
+    // conditions get their own statuses: malformed tools[] → 400, a prompt
+    // that cannot fit the model context → 413 (retrying with the SAME prompt
+    // can never succeed).
+    this.status = code === 'invalid_tools' ? 400 : code === 'prompt_overflow' ? 413 : 502
   }
 }
 
@@ -148,8 +153,16 @@ export function maxToolBridgeAttempts(): number {
 
 /** Whether an error is worth retrying (a probabilistic model failure). */
 export function isRetryableToolBridgeError(err: unknown): boolean {
-  if (err instanceof ToolBridgeError) return err.code === 'invalid_output'
+  if (err instanceof ToolBridgeError) {
+    // An overflow is NOT a probabilistic model flake: the same prompt can
+    // never fit, so a retry would burn 2 extra agy spawns for nothing.
+    if (err.code === 'prompt_overflow') return false
+    return err.code === 'invalid_output'
+  }
+  // An overflow-shaped failure text (engine rethrow, raw agy error) is
+  // classified the same way a parsed ToolBridgeError would be.
   const text = err instanceof Error ? err.message : String(err)
+  if (isAgyPromptOverflow(text)) return false
   // Error text fallbacks so a code-less failure (engine-level rethrow, agy
   // envelope error) still gets the retry treatment when it is schema-shaped.
   return (
@@ -556,6 +569,15 @@ export function parseToolBridgeAnswer(raw: string | Record<string, unknown>, pol
   }
   const envelope = parseToolBridgeEnvelope(raw, policy)
   if (envelope === undefined) {
+    // Overflow check BEFORE the generic "no structured answer": when the
+    // prompt blew the model's context, agy reports the failure through this
+    // same no-envelope channel (an error text in place of the JSON envelope
+    // — or an {error: …} object, which carries no envelope keys). Classifying
+    // it here turns the raw 502 "no structured answer" into an explicit
+    // 413 client error on EVERY bridge path that fails through this parser.
+    const rawText = typeof raw === 'string' ? raw : JSON.stringify(raw)
+    const overflowCause = agyOverflowCause(rawText)
+    if (overflowCause !== undefined) throw agyPromptOverflowError(overflowCause)
     throw new ToolBridgeError(
       'invalid_output',
       'tool bridge: no structured answer in the model text — expected a JSON envelope {content, tool_calls} [' + model + ']',
@@ -621,6 +643,30 @@ export function needsToolBridgeFollowUp(envelope: unknown): boolean {
 /** agy's overflow check, kept in one place so the quote cannot drift. */
 export const AGY_OVERFLOW_RE = /PROMPT_OVERFLOW|prompt is too long|exceeds the maximum|Input is too long/i
 
+/** Whether an error text means the prompt cannot fit the model context. */
 export function isAgyPromptOverflow(text: string): boolean {
   return AGY_OVERFLOW_RE.test(text)
+}
+
+/**
+ * Build the overflow failure: the client's prompt does not fit the model's
+ * context, so a 413 client error replaces the raw 502 "upstream gibberish".
+ * The agy text rides the message verbatim (dsh-agy-link lesson: never hide
+ * the cause).
+ */
+export function agyPromptOverflowError(detail: string): ToolBridgeError {
+  return new ToolBridgeError(
+    'prompt_overflow',
+    'prompt too long for model context: ' + detail.trim(),
+  )
+}
+
+/**
+ * Extract a quotable overflow cause from the places agy reports failures:
+ * the result envelope's error field, a stderr tail, or a raw answer text that
+ * was supposed to carry the JSON envelope. Undefined when none matches.
+ */
+export function agyOverflowCause(text: string): string | undefined {
+  const flat = text.replace(/\s+/g, ' ').trim()
+  return flat !== '' && isAgyPromptOverflow(flat) ? flat : undefined
 }

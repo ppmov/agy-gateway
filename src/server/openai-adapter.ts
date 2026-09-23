@@ -156,6 +156,24 @@ const IMAGE_MIME: Record<string, EngineMessageImage['mediaType']> = {
 }
 
 /**
+ * Whitespace-only text content is a client bug on the roles that CARRY the
+ * request: forwarded to agy it dies as "request carries no user text or
+ * images" — a raw 502 instead of a 400 (Phase 4 finding, MCS robust-empty).
+ * Assistant turns are exempt: an empty/blank text next to tool_calls is the
+ * legitimate "only function calls" turn shape.
+ */
+function rejectBlankText(role: 'system' | 'developer' | 'user' | 'tool', text: string): void {
+  if (text.trim() !== '') return
+  if (role === 'user') {
+    throw bad('user message content must not be empty or whitespace-only (a bare image-only request must carry image_url parts)')
+  }
+  if (role === 'tool') {
+    throw bad('tool message content must not be empty or whitespace-only')
+  }
+  throw bad(role + ' message content must not be empty or whitespace-only')
+}
+
+/**
  * Decode one data:/base64 image_url into staging bytes. Only data: URLs are
  * accepted in M2 (user decision): http(s) fetching from a VPS-resident
  * gateway is an SSRF surface deferred to the M5 hardening pass.
@@ -298,12 +316,19 @@ export async function mapChatRequest(
     const m = raw as Record<string, unknown>
     const role = m.role
     if (role === 'system' || role === 'developer') {
-      systemParts.push(contentToText(m.content, String(role)))
+      const text = contentToText(m.content, String(role))
+      rejectBlankText(role, text)
+      systemParts.push(text)
       continue
     }
     if (role === 'user') {
       if (m.tool_calls !== undefined) throw bad('user messages cannot carry tool_calls')
       const { text, images } = await contentToTextAndImages(m.content, imageBytes)
+      // A blank user turn has nothing to forward UNLESS it carries images
+      // (image-only requests are legitimate — the engine appends its own
+      // inspection prompt): reject a textless turn as a client error instead
+      // of the engine's raw 502 (Phase 4 finding).
+      if (images.length === 0) rejectBlankText('user', text)
       messages.push({ role: 'user', text, ...(images.length > 0 ? { images } : {}) })
       continue
     }
@@ -328,7 +353,9 @@ export async function mapChatRequest(
       if (callId === undefined || (parseMirrorCallId(callId) === null && !isBridgeCallId(callId))) {
         throw bad('tool messages are only accepted as continuations of this gateway\'s own tool calls (agytc-/call_ cursor)')
       }
-      messages.push({ role: 'tool', text: contentToText(m.content, 'tool'), toolCallId: callId })
+      const toolText = contentToText(m.content, 'tool')
+      rejectBlankText('tool', toolText)
+      messages.push({ role: 'tool', text: toolText, toolCallId: callId })
       continue
     }
     if (role === 'function') throw bad('the legacy function role is not supported — use tools in M2')

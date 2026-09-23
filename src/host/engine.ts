@@ -22,7 +22,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import PQueue from 'p-queue'
 import { Err, extractValidationUrl, looksLikeAuthFailure, looksLikeHardRateLimit, looksLikeRateLimit, looksLikeValidationRequired, type GatewayConfig } from '../common/types.ts'
-import { modelFamilyOf, type ModelFamily } from '../common/pool-types.ts'
+import { modelFamilyOf, type ManagedAccount, type ModelFamily } from '../common/pool-types.ts'
 import type { AccountPoolManager } from './pool.ts'
 import { diffConversations, snapshotConversations } from './discovery.ts'
 import { EventMapper, usageFromRaw } from './mapper.ts'
@@ -35,6 +35,7 @@ import { dataDir, stateDir } from '../common/config.ts'
 import type { SessionStore } from './sessions.ts'
 import { CallId, type StreamChunk, type TokenUsage } from './stream-types.ts'
 import * as gatewayPatch from '../patch/gateway-patch.ts'
+import { ShortCooldownStore } from '../patch/antigravity-429-classifier.ts'
 import { MIRROR_TOOL_NAME } from './mirror.ts'
 import {
   buildToolBridgePrompt,
@@ -86,6 +87,16 @@ export function computeRetryDelayMs(
   const jittered = baseMs * (1 + (2 * rand() - 1) * RETRY_POLICY.jitterRatio)
   return Math.max(0, Math.min(maxMs, Math.round(jittered)))
 }
+
+/**
+ * Prompts longer than this ride the stream-json stdin transport instead of the
+ * `-p <prompt>` argv value: one argv entry is capped by MAX_ARG_STRLEN
+ * (~128KB on Linux) and a long cron prompt dies with spawn E2BIG. The stdin
+ * transport (the same one the tool bridge uses, verified against agy 1.6.5)
+ * has no such ceiling. 100KB keeps a safe margin under it — the full argv
+ * also carries flag words and the env block.
+ */
+export const STDIN_PROMPT_THRESHOLD = 100 * 1024
 
 /** Default retry-delay implementation used when deps.retryDelay is absent. */
 export function defaultRetryDelay(ms: number): Promise<void> {
@@ -337,6 +348,13 @@ function* recutToolBridgeSpan(
     { type: 'usage', usage: { inputTokens: 0, outputTokens: 0 } },
     { type: 'finish', reason: { kind: 'error', failure: { message, code: Err.INVALID_OUTPUT } } },
   ]
+  // Client-side bridge failures keep their own status through the recut:
+  // overflow (413) and malformed tools[] (400) are NOT upstream 502-class
+  // failures — the HTTP mapping reads the failure code off this chunk.
+  const bridgeFailure = (err: ToolBridgeError): StreamChunk[] => [
+    { type: 'usage', usage: { inputTokens: 0, outputTokens: 0 } },
+    { type: 'finish', reason: { kind: 'error', failure: { message: err.message, code: err.code === 'prompt_overflow' ? Err.PROMPT_OVERFLOW : err.code === 'invalid_tools' ? Err.INVALID_TOOLS : Err.INVALID_OUTPUT } } },
+  ]
 
   if (raw === undefined) {
     // No result envelope: the run failed upstream (quota/auth/process/empty).
@@ -358,6 +376,10 @@ function* recutToolBridgeSpan(
   try {
     turn = parseToolBridgeAnswer(raw, policy, model)
   } catch (err) {
+    if (err instanceof ToolBridgeError && err.code !== 'invalid_output') {
+      yield* bridgeFailure(err)
+      return
+    }
     yield* failure(err instanceof ToolBridgeError ? err.message : 'tool bridge: ' + brief(String(err)))
     return
   }
@@ -546,7 +568,72 @@ export class AgyEngine {
    */
   private liveAgyChildren = 0
 
+  /**
+   * CLIProxyAPI short-cooldown store (gateway-patch 429 integration): the
+   * account|model windows for `short_cooldown_switch_auth` rate limits —
+   * lighter than a full recordFailure cooldown, consulted alongside the pool
+   * cooldowns so a <5m limit window switches auth instead of freezing the
+   * account out of rotation for the blunt 15m default.
+   */
+  private readonly shortCooldowns = new ShortCooldownStore()
+
   constructor(private readonly deps: EngineDeps) {}
+
+  /**
+   * Full 429-integration gate (replaces the blunt looksLikeHardRateLimit
+   * cooldown switch). `decideEngineCooldown` refines the hard-limit signal
+   * into two action classes; the engine additionally honors the classifier's
+   * instant-retry / short-cooldown kinds, which the blunt gate conflated:
+   *  - full_cooldown  (full_quota_exhausted / >=5m windows): the account
+   *    leaves rotation via pool.recordFailure (the default 15m cooldown, or
+   *    the upstream reset time when the error text carries one).
+   *  - short_cooldown (<5m windows): a ShortCooldownStore window keyed by
+   *    account|model marks the account unavailable for just that window, and
+   *    `switchAuth: true` tells the retry loop to move to the next account.
+   * Soft signals (model overloaded) still never cool an account down.
+   */
+  private applyRateLimitCooldown(accountId: string, family: ModelFamily, rawErrText: string): { switchAuth: boolean } {
+    const verdict = gatewayPatch.decideEngineCooldown(rawErrText)
+    if (verdict.kind === 'full_cooldown') {
+      // The pool parses its own reset duration out of the reason text
+      // ("Resets in 21m25s") — pass the raw signature through unchanged.
+      this.deps.pool?.recordFailure(accountId, family, rawErrText)
+      return { switchAuth: true }
+    }
+    if (verdict.kind === 'instant_retry') {
+      // The upstream window is under 3s — no cooldown of any kind; the same
+      // auth is good to go again immediately (the pool never learns of it).
+      return { switchAuth: false }
+    }
+    // short_cooldown: mark a <5m window and switch accounts for the next
+    // selection (keyed account|family, self-cleaning after the window).
+    this.shortCooldowns.mark(accountId, family, Date.now(), verdict.cooldownMs)
+    return { switchAuth: true }
+  }
+
+  /**
+   * Selection filter seam: folds the pool's own cooldown/quota skip logic
+   * with the engine's short-cooldown store (a <5m window must read as "in
+   * cooldown" even though the pool itself never recorded one).
+   */
+  private selectAccountFor(family: ModelFamily, busy?: ReadonlySet<string>): ManagedAccount | null | undefined {
+    const pool = this.deps.pool
+    if (!pool) return undefined
+    const acc = pool.selectAccount(family, busy)
+    if (acc === null || !this.shortCooldowns.isInCooldown(acc.id, family, Date.now())) return acc
+    // The picked account sits in a short-cooldown window: exclude it (as
+    // busy) and re-select so the request switches auth within the same call.
+    // When the pool is exhausted this falls through to the busy-less
+    // selection (same tradeoff as the busy filter) and may hand the same
+    // account back — the request still routes.
+    const exclude = new Set(busy ?? [])
+    exclude.add(acc.id)
+    const next = pool.selectAccount(family, exclude)
+    if (next !== null && next.id !== acc.id && !this.shortCooldowns.isInCooldown(next.id, family, Date.now())) {
+      return next
+    }
+    return acc
+  }
 
   private trackBusy(id: string | undefined): void {
     if (id === undefined) return
@@ -754,13 +841,13 @@ export class AgyEngine {
     // skipped by selectAccount so concurrent requests spread across the pool
     // (M5: acceptance §4 互不阻塞 / ≥2.5× throughput). Busy-but-healthy pools
     // fall through to the unfiltered selection inside the pool.
-    let account = this.deps.pool ? this.deps.pool.selectAccount(family, this.busyAccounts) : undefined
+    let account = this.selectAccountFor(family, this.busyAccounts)
     if (this.deps.pool && this.deps.pool.getAccounts().length > 0 && !account) {
       if (cfg.autoFallbackModel) {
         const fallbackSlugs = ['gemini-3.5-flash', 'gemini-3.6-flash']
         for (const fb of fallbackSlugs) {
           const fbFam = modelFamilyOf(fb)
-          const fbAcc = this.deps.pool.selectAccount(fbFam)
+          const fbAcc = this.selectAccountFor(fbFam)
           if (fbAcc) {
             account = fbAcc
             family = fbFam
@@ -999,6 +1086,33 @@ export class AgyEngine {
           '--json-schema', JSON.stringify(envelopeSchema),
           ...stripped,
           '--sandbox',
+        ]
+        stdinData = JSON.stringify({ event: 'user', message: { role: 'user', content: prompt } }) + '\n'
+      } else if (prompt.length >= STDIN_PROMPT_THRESHOLD) {
+        // E2BIG guard (primary cause 6): the `-p <prompt>` argv value is one
+        // entry, capped by MAX_ARG_STRLEN (~128KB on Linux) — a long cron
+        // prompt dies with spawn E2BIG. Reroute ONLY the transport to the
+        // same stream-json/stdin form the bridge uses (`--input-format
+        // stream-json`, one `{event:'user'}` NDJSON line on stdin — the mode
+        // verified live against agy 1.6.5), keeping plain-prompt semantics:
+        // no envelope schema, no --sandbox, model/effort/conversation flags
+        // untouched. Prompts under the threshold keep the argv form.
+        const stripped: string[] = []
+        for (let i = 0; i < args.length; i++) {
+          const a = args[i]
+          if (a === '-p' || a === '--print') {
+            i++ // drop the prompt value that follows
+            continue
+          }
+          if (a === '--input-format') {
+            i++ // rewritten here — defensive; buildArgs never adds it
+            continue
+          }
+          stripped.push(a as string)
+        }
+        args = [
+          '--input-format', 'stream-json',
+          ...stripped,
         ]
         stdinData = JSON.stringify({ event: 'user', message: { role: 'user', content: prompt } }) + '\n'
       }
@@ -1255,12 +1369,12 @@ export class AgyEngine {
           failure = { kind: 'error', code: Err.VALIDATION_REQUIRED, message: url !== undefined ? detail + ' (validation_url: ' + url + ')' : detail }
         } else if (isRateLimit) {
           const bestMsg = parser.stats.lastResultError || (outcome.stderrTail ? brief(outcome.stderrTail) : 'Rate limit or quota reached')
-          // gateway-patch: CLIProxyAPI 429-classifier refines the blunt hard-limit
-          // signal — TODO(full integration): switch on gatewayPatch.decideEngineCooldown()
-          // kind to route instant_retry_same_auth / short_cooldown_switch_auth
-          // (<5m windows) through account switch instead of the blunt cooldown
-          // below; MVP keeps looksLikeHardRateLimit as the gate (not breaking
-          // the Sakiko15 pipeline — working-point patch only).
+          // gateway-patch: CLIProxyAPI 429-classifier drives the routing
+          // decision (full integration). The decision itself is made at
+          // settle time via applyRateLimitCooldown (full cooldown →
+          // recordFailure; instant/short windows → ShortCooldownStore +
+          // account switch); the message below still carries the raw kind so
+          // clients/logs keep the refined signal.
           const d429 = gatewayPatch.classifyAgy429(bestMsg)
           failure = { kind: 'error', code: Err.AGY_ERROR, message: 'Google Antigravity quota / rate limit reached (' + d429.kind + '): ' + bestMsg }
         } else if (!consumable) {
@@ -1397,7 +1511,7 @@ export class AgyEngine {
           // POOL_EXHAUSTED.
           if ((this.deps.pool?.getAccounts().length ?? 0) > 0) {
             this.untrackBusy(attemptAccount?.id)
-            const next = this.deps.pool?.selectAccount(family, this.busyAccounts) ?? undefined
+            const next = this.selectAccountFor(family, this.busyAccounts) ?? undefined
             if (next === undefined) {
               this.trackBusy(attemptAccount?.id)
               break
@@ -1429,11 +1543,15 @@ export class AgyEngine {
           }
         } else {
           const effectiveRateLimit = looksLikeRateLimit(last.rawErrText) || looksLikeRateLimit(last.failure.message)
-          // Cooldown is a costly local penalty (account leaves rotation): only
-          // HARD server-issued signatures may trigger it. Soft signals (model
-          // overloaded) shape the message above but never cool the account.
+          // Full 429 integration (gateway-patch): decideEngineCooldown splits
+          // the blunt hard-limit signal into full_quota_exhausted (→ pool
+          // cooldown, account leaves rotation) and the <5m/instant windows
+          // (→ ShortCooldownStore + account switch on the next selection).
+          // Soft signals (model overloaded) decide short_cooldown neither
+          // records a window nor cools the account down — the message above
+          // is all they shape.
           if (last.account && looksLikeHardRateLimit(last.rawErrText)) {
-            this.deps.pool?.recordFailure(last.account.id, family, last.failure.message)
+            this.applyRateLimitCooldown(last.account.id, family, last.rawErrText)
           }
           if (last.account && (last.failure.code === Err.AUTH || last.failure.code === Err.VALIDATION_REQUIRED || /invalid_grant|not signed in|auth/i.test(last.failure.message))) {
             this.deps.pool?.markAuthRequired(last.account.id, last.failure.message)

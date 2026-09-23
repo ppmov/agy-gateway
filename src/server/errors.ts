@@ -70,6 +70,12 @@ export function errorStatus(code: string): { statusCode: number; type: string } 
     case 'AGY_ERROR':
     case 'AGY_VERSION_UNSUPPORTED':
       return { statusCode: 502, type: 'api_error' }
+    case 'PROMPT_OVERFLOW':
+      // Client-side condition: the prompt cannot fit the model context, the
+      // same prompt can never succeed → 413 (ToolBridgeError.status mirror).
+      return { statusCode: 413, type: 'invalid_request_error' }
+    case 'INVALID_TOOLS':
+      return { statusCode: 400, type: 'invalid_request_error' }
     default:
       return { statusCode: 500, type: 'api_error' }
   }
@@ -147,6 +153,12 @@ export function anthropicStatusFor(code: string, message: string): { statusCode:
     case 'AGY_ERROR':
     case 'AGY_VERSION_UNSUPPORTED':
       return { statusCode: 502, type: 'api_error' }
+    case 'PROMPT_OVERFLOW':
+      // Mirror of the OpenAI mapping: a prompt that cannot fit the model
+      // context is a client-side condition, not an upstream failure.
+      return { statusCode: 413, type: 'invalid_request_error' }
+    case 'INVALID_TOOLS':
+      return { statusCode: 400, type: 'invalid_request_error' }
     default:
       return { statusCode: 500, type: 'api_error' }
   }
