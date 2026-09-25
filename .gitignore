@@ -8,3 +8,7 @@ data/
 .spec/
 research/
 testrun/
+
+# prod runtime (secrets + account data) — never push
+prod.env
+prod-data/

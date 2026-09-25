@@ -260,3 +260,28 @@ npm test        # vitest run
 Golden cases live under `test/golden/<protocol>/<case>/` (request + events + expected +
 PROVENANCE.md); the runner in `test/golden.test.ts` replays each through the real HTTP
 stack with fake-agy. Node >= 24 required.
+
+## Operations (prod)
+
+Production unit: `agy-gateway.service` (systemd, активен и в автозагрузке с go-live 23.09.2026 05:42 UTC; порт **8300**).
+
+**Конфигурация:**
+- `/opt/agy-gateway/prod.env` — env прод-процесса (`AGY_PROXY_API_KEY`, `AGY_PROXY_ADMIN_ALLOW_CIDR`, ...);
+- `/opt/agy-gateway/prod-data/` — данные (`agy-proxy.db`: API-ключи, usage-леджер, admin-сессии; keys-enc.key; WAL).
+
+**Диагностика:**
+
+```bash
+systemctl status agy-gateway
+journalctl -u agy-gateway -n 50
+curl -s http://127.0.0.1:8300/healthz
+```
+
+**⛔ ЗАПРЕТ `DELETE /admin/pool/accounts`:** upstream-реализация делает `rm -rf` каталога аккаунта (`account.dir`). Каталоги `/root/.agy-accounts/*` — только бэкап; удаление аккаунтов через admin-API не использовать.
+
+**Откат на star-cliproxy:**
+
+```bash
+systemctl disable --now agy-gateway
+systemctl enable --now star-cliproxy
+```
