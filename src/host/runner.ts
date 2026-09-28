@@ -315,6 +315,16 @@ export function startAgyProcess(opts: RunOptions): RunningProcess {
     stdio: ['pipe', 'pipe', 'pipe'],
     windowsHide: true,
   })
+  // EPIPE guard (t_8d043eb1): an agy child that dies while a large prompt
+  // (100KB+ cron payloads ride stdin) is still draining into the pipe makes
+  // the pending stdin write fail asynchronously with `write EPIPE`. The
+  // sync throw from write() is caught below, but the deferred 'error' event
+  // is not, and with no listener it escalates to an uncaughtException —
+  // crashToExit then exits 1 and kills in-flight HTTP streams (observed
+  // 25.09 13:55). A failed prompt write already surfaces through the
+  // child's exit/timeout handling, so silencing the event here loses
+  // nothing: the outcome promise reports the child's fate either way.
+  child.stdin?.on('error', () => {})
   let stdout = ''
   let stderr = ''
   let timedOut = false

@@ -23,5 +23,18 @@ export function buildLogger(
     level,
     redact: { paths: REDACT_PATHS, censor: '[redacted]' },
   }
-  return destination !== undefined ? pino(options, destination) : pino(options)
+  if (destination !== undefined) {
+    return pino(options, destination)
+  }
+  // Async stdout sink (EPIPE fix): the bare pino() default writes synchronously
+  // to process.stdout, and when the log reader goes away (journal rotation,
+  // pipe close) the failed write escalates to an uncaughtException — the
+  // process-level crashToExit then exits 1 and takes in-flight HTTP streams
+  // with it. pino.destination({ dest: 1, sync: false }) moves writes to a
+  // background sink whose failures surface as 'error' events instead of raw
+  // throws; they are swallowed here because a lost log line must never cost
+  // the gateway (and its live client streams) the process.
+  const sink = pino.destination({ dest: 1, sync: false })
+  sink.on('error', () => {})
+  return pino(options, sink)
 }
