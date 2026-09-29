@@ -268,6 +268,23 @@ export interface GarbageEvent {
   line: string
 }
 
+/**
+ * Whether a result envelope's `structured_output` carries an actual answer.
+ *
+ * The CANCELED-empty shape (#902) is recognised by ABSENT CONTENT, never by an
+ * absent key: agy may serialize the schema envelope it never filled as `''`
+ * or as `{}` instead of omitting the field. Absent (`undefined`/`null`), the
+ * empty string (whitespace included), the empty array and the empty object are
+ * all "no answer"; anything else counts as content.
+ */
+export function hasStructuredContent(value: unknown): boolean {
+  if (value === undefined || value === null) return false
+  if (typeof value === 'string') return value.trim() !== ''
+  if (Array.isArray(value)) return value.length > 0
+  if (typeof value === 'object') return Object.keys(value as Record<string, unknown>).length > 0
+  return true
+}
+
 // Auth-failure sniffing shared by the runner tail, parser output and the
 // result envelope (observed on agy 1.1.13: an authentication-required
 // banner plus result.error text).

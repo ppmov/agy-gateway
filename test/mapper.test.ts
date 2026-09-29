@@ -321,6 +321,31 @@ describe('mapper', () => {
     expect(m.isFinished).toBe(false)
   })
 
+  it('ok result with an EMPTY structured_output ("" or {}) stays passive — no empty success finish', () => {
+    // #902 CANCELED-empty with the schema envelope serialized-but-unfilled:
+    // '' and {} are "absent content" exactly like an omitted key. Finishing
+    // the span here would ship the empty 200 the engine's retry gate exists to
+    // prevent (it can only retry while nothing reached the client).
+    for (const structuredOutput of ['', {}, []]) {
+      const m = newSpan()
+      const chunks = mapAll(m, [
+        { kind: 'result', conversationId: 'c-x', ok: true, response: '', structuredOutput, usage: {} },
+      ])
+      expect(chunks.length).toBe(0)
+      expect(m.isFinished).toBe(false)
+    }
+  })
+
+  it('ok result with real structured_output content still finishes (the guard is not a blanket passivity)', () => {
+    const m = newSpan()
+    const chunks = mapAll(m, [
+      { kind: 'result', conversationId: 'c-y', ok: true, response: '', structuredOutput: { content: 'hi', tool_calls: [] }, usage: {} },
+    ])
+    const finish = asFinish(lastChunk(chunks))
+    expect(finish.reason.kind).toBe('stop')
+    expect(m.isFinished).toBe(true)
+  })
+
   it('mirrorCallId round-trips through parseMirrorCallId', () => {
     const id = mirrorCallId('0f1e2d3c-4b5a-6789-9abc-def012345678', 42)
     expect(id).toBe('agytc-0f1e2d3c-4b5a-6789-9abc-def012345678-42')

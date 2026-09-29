@@ -144,11 +144,20 @@ export class RunRecording {
     return this.resultConversationId !== null || this.events.some((e) => e.kind === 'result')
   }
 
-  /** The last result envelope's finish-relevant projection, when one arrived. */
-  getResultEvent(): { ok: boolean; response: string } | null {
+  /** The last result envelope's finish-relevant projection, when one arrived.
+   *  `structuredOutput` rides along verbatim (untyped) because the emptiness
+   *  of the CANCELED shape is decided on its CONTENT (absent / '' / {} are all
+   *  "no answer"), not on the presence of the key. */
+  getResultEvent(): { ok: boolean; response: string; structuredOutput?: unknown } | null {
     for (let i = this.events.length - 1; i >= 0; i--) {
       const ev = this.events[i]
-      if (ev !== undefined && ev.kind === 'result') return { ok: ev.ok, response: ev.response }
+      if (ev !== undefined && ev.kind === 'result') {
+        return {
+          ok: ev.ok,
+          response: ev.response,
+          ...(ev.structuredOutput !== undefined ? { structuredOutput: ev.structuredOutput } : {}),
+        }
+      }
     }
     return null
   }

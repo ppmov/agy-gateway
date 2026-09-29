@@ -21,7 +21,7 @@ import { randomUUID } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import PQueue from 'p-queue'
-import { Err, extractValidationUrl, looksLikeAuthFailure, looksLikeHardRateLimit, looksLikeRateLimit, looksLikeValidationRequired, type GatewayConfig } from '../common/types.ts'
+import { Err, extractValidationUrl, hasStructuredContent, looksLikeAuthFailure, looksLikeHardRateLimit, looksLikeRateLimit, looksLikeValidationRequired, type GatewayConfig } from '../common/types.ts'
 import { modelFamilyOf, type ManagedAccount, type ModelFamily } from '../common/pool-types.ts'
 import type { AccountPoolManager } from './pool.ts'
 import { diffConversations, snapshotConversations } from './discovery.ts'
@@ -415,7 +415,7 @@ function lastResultResponse(rec: RunRecording, from: number): string | Record<st
   for (let i = rec.length - 1; i >= from; i--) {
     const ev = rec.eventAt(i)
     if (ev === undefined || ev.kind !== 'result') continue
-    if (ev.structuredOutput !== undefined && ev.structuredOutput !== null) {
+    if (hasStructuredContent(ev.structuredOutput)) {
       return typeof ev.structuredOutput === 'string'
         ? ev.structuredOutput
         : (ev.structuredOutput as Record<string, unknown>)
@@ -1345,7 +1345,7 @@ export class AgyEngine {
         // tool turns): agy ends with status=CANCELED / empty response yet exits
         // 0, and the parser classifies it ok. The client would see an empty
         // success; intercept it as a retryable INVALID_OUTPUT failure instead.
-        const canceledEmpty = r !== null && r.ok && r.response === '' && !rec.sawTextBefore(rec.length)
+        const canceledEmpty = r !== null && r.ok && r.response === '' && !hasStructuredContent(r.structuredOutput) && !rec.sawTextBefore(rec.length)
         const consumable = r !== null && (r.ok || r.response !== '') && !canceledEmpty
         // Error classification scans ONLY stderr and the result envelope's
         // error field. stdout is model prose + event JSON: a run whose streamed
@@ -1489,7 +1489,7 @@ export class AgyEngine {
           // invisible to the client. Any recorded step (text/reasoning/tool)
           // may have streamed to the client: no replay.
           const canceledEmptyShape =
-            last.resultEvent !== null && last.resultEvent.ok && last.resultEvent.response === '' && !rec.sawTextBefore(rec.length)
+            last.resultEvent !== null && last.resultEvent.ok && last.resultEvent.response === '' && !hasStructuredContent(last.resultEvent.structuredOutput) && !rec.sawTextBefore(rec.length)
           const shapeOnly =
             last.resultEvent === null ||
             (!last.resultEvent.ok && last.resultEvent.response === '') ||
@@ -1690,7 +1690,7 @@ export class AgyEngine {
       let freshResponse: string | Record<string, unknown> | undefined
       const capture = (ev: { kind: string; response?: string; structuredOutput?: unknown }): void => {
         if (ev.kind !== 'result') return
-        if (ev.structuredOutput !== undefined && ev.structuredOutput !== null) {
+        if (hasStructuredContent(ev.structuredOutput)) {
           freshResponse = typeof ev.structuredOutput === 'string'
             ? ev.structuredOutput
             : (ev.structuredOutput as Record<string, unknown>)

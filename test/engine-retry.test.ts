@@ -317,6 +317,61 @@ describe('engine-level single retry', () => {
     }, { timeout: 5_000, interval: 10 })
   })
 
+  it('the #902 CANCELED shape with an EMPTY structured_output ("") is retried before the client sees anything', async () => {
+    // The CANCELED envelope may carry `structured_output: ''` instead of
+    // leaving it undefined (agy serializes the schema envelope it never
+    // filled). "Absent content" — not "absent key" — is what makes the shape
+    // empty: the guard must treat '' like undefined, or the mapper finishes
+    // the span with a silent stop and the empty 200 escapes.
+    const h = mk()
+    const canceled = join(h.dir, 'canceled-empty-string.ndjson')
+    appendFileSync(canceled, JSON.stringify({ event: 'init', conversation_id: 'c-x', model: 'gemini' }) + '\n')
+    appendFileSync(canceled, JSON.stringify({ event: 'result', result: { conversation_id: 'c-x', status: 'CANCELED', response: '', structured_output: '', usage: { input_tokens: 3, output_tokens: 0 } } }) + '\n')
+    const recovered = join(h.dir, 'recovered.ndjson')
+    appendFileSync(recovered, JSON.stringify({ event: 'init', conversation_id: 'c-y', model: 'gemini' }) + '\n')
+    appendFileSync(recovered, JSON.stringify({ event: 'result', result: { conversation_id: 'c-y', status: 'SUCCESS', response: 'recovered answer', usage: { input_tokens: 3, output_tokens: 4 } } }) + '\n')
+    process.env.FAKE_AGY_EVENTS_FILES = canceled + ',' + recovered
+    process.env.FAKE_AGY_EVENTS_SEQ_FILE = join(h.dir, 'fake-seq')
+    process.env.FAKE_AGY_EXIT_CODE = '0'
+    const chunks = await collect(h.engine.stream(call([msg('user', 'hi')])))
+    expect(h.spawns()).toBe(2)
+    expect(h.delays).toEqual([RETRY_POLICY.initialDelayMs])
+    const finish = finishOf(chunks)
+    expect(finish.reason.kind).toBe('stop')
+    expect(finish.reason.failure).toBeUndefined()
+    expect(textOf(chunks)).toContain('recovered answer')
+    await vi.waitFor(() => {
+      expect(h.onRunCalls).toHaveLength(2)
+      expect(h.onRunCalls[0]).toMatchObject({ attempt: 0, final: false, ok: false, code: Err.INVALID_OUTPUT })
+      expect(h.onRunCalls[1]).toMatchObject({ attempt: 1, final: true, ok: true, code: 'OK' })
+    }, { timeout: 5_000, interval: 10 })
+  })
+
+  it('an exhausted #902 CANCELED run with an EMPTY structured OBJECT ({}) ends in an error finish', async () => {
+    // Same absolute criterion on the object form: `structured_output: {}` is
+    // an empty envelope, never a silent success.
+    const h = mk()
+    const canceled = join(h.dir, 'canceled-empty-object.ndjson')
+    appendFileSync(canceled, JSON.stringify({ event: 'init', conversation_id: 'c-x', model: 'gemini' }) + '\n')
+    appendFileSync(canceled, JSON.stringify({ event: 'result', result: { conversation_id: 'c-x', status: 'CANCELED', response: '', structured_output: {}, usage: { input_tokens: 3, output_tokens: 0 } } }) + '\n')
+    process.env.FAKE_AGY_EVENTS_FILES = canceled + ',' + canceled
+    process.env.FAKE_AGY_EVENTS_SEQ_FILE = join(h.dir, 'fake-seq')
+    process.env.FAKE_AGY_EXIT_CODE = '0'
+    const chunks = await collect(h.engine.stream(call([msg('user', 'hi')])))
+    expect(h.spawns()).toBe(2)
+    expect(h.delays).toEqual([RETRY_POLICY.initialDelayMs])
+    const finish = finishOf(chunks)
+    expect(finish.reason.kind).toBe('error')
+    expect(finish.reason.failure?.code).toBe(Err.INVALID_OUTPUT)
+    expect(finish.reason.failure?.message).toContain('#902')
+    expect(textOf(chunks)).toBe('')
+    await vi.waitFor(() => {
+      expect(h.onRunCalls).toHaveLength(2)
+      expect(h.onRunCalls[0]).toMatchObject({ attempt: 0, final: false, ok: false, code: Err.INVALID_OUTPUT })
+      expect(h.onRunCalls[1]).toMatchObject({ attempt: 1, final: true, ok: false, code: Err.INVALID_OUTPUT })
+    }, { timeout: 5_000, interval: 10 })
+  })
+
   it('an exhausted #902 CANCELED-empty run ends in an error finish, never an empty success', async () => {
     // Same shape on every attempt: the client must get the INVALID_OUTPUT
     // failure (502-class / error finish) — the silent `stop` success with zero

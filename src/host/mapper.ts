@@ -19,6 +19,7 @@
 // spans address the mirror tool directly).
 import { CallId, type StreamChunk, type TokenUsage } from './stream-types.ts'
 import type { AgyEvent, RawUsage } from '../common/types.ts'
+import { hasStructuredContent } from '../common/types.ts'
 import { mirrorCallId } from './recording.ts'
 import { MIRROR_TOOL_NAME } from './mirror.ts'
 import { scrubTokenMaterial } from './diagnostics.ts'
@@ -232,7 +233,7 @@ export class EventMapper {
       this.finished = true
       return
     }
-    if (ev.response === '' && ev.structuredOutput === undefined && !this.sawTextStep) {
+    if (ev.response === '' && !hasStructuredContent(ev.structuredOutput) && !this.sawTextStep) {
       // #902 CANCELED-empty (status=CANCELED, exit 0, no answer, nothing
       // streamed): stay PASSIVE here. Finishing the span on this envelope
       // shipped an empty 200-success to the client BEFORE the engine
@@ -242,6 +243,11 @@ export class EventMapper {
       // decision: it retries the shape while nothing reached the wire, and
       // otherwise surfaces the failure through rec.failureInfo. Mirrors the
       // `!ok` + empty-response branch above.
+      //
+      // The emptiness test is CONTENT-based, not key-based: agy may serialize
+      // the schema envelope it never filled as '' or {} instead of omitting
+      // the field, and a key-presence guard let those forms through (mapper
+      // finished with a bare stop ⇒ empty 200 escaped again).
       return
     }
     if (!this.sawTextStep && ev.response !== '') {
