@@ -23,7 +23,7 @@ const fakeBin = process.execPath
 const fakeScript = join(import.meta.dirname, 'fake-agy.mjs')
 
 const dirs: string[] = []
-const ENV_KEYS = ['FAKE_AGY_MODE', 'FAKE_AGY_MODE_FILE', 'FAKE_AGY_ARGS_FILE', 'FAKE_AGY_EVENTS_FILE', 'FAKE_AGY_EXIT_CODE'] as const
+const ENV_KEYS = ['FAKE_AGY_MODE', 'FAKE_AGY_MODE_FILE', 'FAKE_AGY_ARGS_FILE', 'FAKE_AGY_EVENTS_FILE', 'FAKE_AGY_EVENTS_FILES', 'FAKE_AGY_EVENTS_SEQ_FILE', 'FAKE_AGY_EXIT_CODE'] as const
 
 afterEach(() => {
   for (const dir of dirs.splice(0)) {
@@ -287,24 +287,61 @@ describe('engine-level single retry', () => {
     expect(h.delays).toEqual([])
   })
 
-  it('the #902 CANCELED-empty shape never retries behind the served client', async () => {
-    // The CANCELED envelope parses ok (status !== ERROR), so the mapper ships
-    // a success finish before the engine classifies; the engine-side
-    // settlement is the INVALID_OUTPUT failure (accounting + no retry) — a
-    // hidden retry would double-run a turn the client already saw served.
+  it('the #902 CANCELED-empty shape is retried BEFORE the client sees anything', async () => {
+    // The CANCELED envelope parses ok (status !== ERROR) but carries no answer
+    // and nothing streamed: the mapper stays PASSIVE (it must not ship an empty
+    // success finish), so the engine may retry the shape invisibly — exactly
+    // like the outcome-level failures above. The rescued attempt serves a real
+    // answer, so no empty 200 ever leaves the gateway.
     const h = mk()
-    const eventsFile = join(h.dir, 'events.ndjson')
-    appendFileSync(eventsFile, JSON.stringify({ event: 'init', conversation_id: 'c-x', model: 'gemini' }) + '\n')
-    appendFileSync(eventsFile, JSON.stringify({ event: 'result', result: { conversation_id: 'c-x', status: 'CANCELED', response: '', usage: { input_tokens: 3, output_tokens: 0 } } }) + '\n')
-    process.env.FAKE_AGY_EVENTS_FILE = eventsFile
+    const canceled = join(h.dir, 'canceled.ndjson')
+    appendFileSync(canceled, JSON.stringify({ event: 'init', conversation_id: 'c-x', model: 'gemini' }) + '\n')
+    appendFileSync(canceled, JSON.stringify({ event: 'result', result: { conversation_id: 'c-x', status: 'CANCELED', response: '', usage: { input_tokens: 3, output_tokens: 0 } } }) + '\n')
+    const recovered = join(h.dir, 'recovered.ndjson')
+    appendFileSync(recovered, JSON.stringify({ event: 'init', conversation_id: 'c-y', model: 'gemini' }) + '\n')
+    appendFileSync(recovered, JSON.stringify({ event: 'result', result: { conversation_id: 'c-y', status: 'SUCCESS', response: 'recovered answer', usage: { input_tokens: 3, output_tokens: 4 } } }) + '\n')
+    process.env.FAKE_AGY_EVENTS_FILES = canceled + ',' + recovered
+    process.env.FAKE_AGY_EVENTS_SEQ_FILE = join(h.dir, 'fake-seq')
     process.env.FAKE_AGY_EXIT_CODE = '0'
     const chunks = await collect(h.engine.stream(call([msg('user', 'hi')])))
-    expect(h.spawns()).toBe(1)
-    expect(h.delays).toEqual([])
-    expect(finishOf(chunks).reason.kind).toBe('stop')
+    expect(h.spawns()).toBe(2)
+    expect(h.delays).toEqual([RETRY_POLICY.initialDelayMs])
+    const finish = finishOf(chunks)
+    expect(finish.reason.kind).toBe('stop')
+    expect(finish.reason.failure).toBeUndefined()
+    expect(textOf(chunks)).toContain('recovered answer')
     await vi.waitFor(() => {
-      expect(h.onRunCalls).toHaveLength(1)
-      expect(h.onRunCalls[0]).toMatchObject({ attempt: 0, final: true, ok: false, code: Err.INVALID_OUTPUT })
+      expect(h.onRunCalls).toHaveLength(2)
+      expect(h.onRunCalls[0]).toMatchObject({ attempt: 0, final: false, ok: false, code: Err.INVALID_OUTPUT })
+      expect(h.onRunCalls[1]).toMatchObject({ attempt: 1, final: true, ok: true, code: 'OK' })
+    }, { timeout: 5_000, interval: 10 })
+  })
+
+  it('an exhausted #902 CANCELED-empty run ends in an error finish, never an empty success', async () => {
+    // Same shape on every attempt: the client must get the INVALID_OUTPUT
+    // failure (502-class / error finish) — the silent `stop` success with zero
+    // content that used to reach it BEFORE the engine classified is the defect
+    // this contract forbids.
+    const h = mk()
+    const canceled = join(h.dir, 'canceled.ndjson')
+    appendFileSync(canceled, JSON.stringify({ event: 'init', conversation_id: 'c-x', model: 'gemini' }) + '\n')
+    appendFileSync(canceled, JSON.stringify({ event: 'result', result: { conversation_id: 'c-x', status: 'CANCELED', response: '', usage: { input_tokens: 3, output_tokens: 0 } } }) + '\n')
+    process.env.FAKE_AGY_EVENTS_FILES = canceled + ',' + canceled
+    process.env.FAKE_AGY_EVENTS_SEQ_FILE = join(h.dir, 'fake-seq')
+    process.env.FAKE_AGY_EXIT_CODE = '0'
+    const chunks = await collect(h.engine.stream(call([msg('user', 'hi')])))
+    expect(h.spawns()).toBe(2)
+    expect(h.delays).toEqual([RETRY_POLICY.initialDelayMs])
+    const finish = finishOf(chunks)
+    expect(finish.reason.kind).toBe('error')
+    expect(finish.reason.failure?.code).toBe(Err.INVALID_OUTPUT)
+    expect(finish.reason.failure?.message).toContain('#902')
+    // Nothing was streamed to the client as content.
+    expect(textOf(chunks)).toBe('')
+    await vi.waitFor(() => {
+      expect(h.onRunCalls).toHaveLength(2)
+      expect(h.onRunCalls[0]).toMatchObject({ attempt: 0, final: false, ok: false, code: Err.INVALID_OUTPUT })
+      expect(h.onRunCalls[1]).toMatchObject({ attempt: 1, final: true, ok: false, code: Err.INVALID_OUTPUT })
     }, { timeout: 5_000, interval: 10 })
   })
 

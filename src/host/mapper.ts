@@ -232,6 +232,18 @@ export class EventMapper {
       this.finished = true
       return
     }
+    if (ev.response === '' && ev.structuredOutput === undefined && !this.sawTextStep) {
+      // #902 CANCELED-empty (status=CANCELED, exit 0, no answer, nothing
+      // streamed): stay PASSIVE here. Finishing the span on this envelope
+      // shipped an empty 200-success to the client BEFORE the engine
+      // classified it (the engine's canceledEmpty guard marks it a retryable
+      // INVALID_OUTPUT failure), so the silent success could not be retried
+      // and could not be replaced by an error finish. The engine now owns the
+      // decision: it retries the shape while nothing reached the wire, and
+      // otherwise surfaces the failure through rec.failureInfo. Mirrors the
+      // `!ok` + empty-response branch above.
+      return
+    }
     if (!this.sawTextStep && ev.response !== '') {
       yield* this.ensureBlock('text')
       const d = this.appendDelta(ev.response)

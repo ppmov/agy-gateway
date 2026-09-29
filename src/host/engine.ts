@@ -1484,11 +1484,16 @@ export class AgyEngine {
           // Retry gate (M5): only outcome-level failures with nothing on the
           // wire. A result-shaped failure never emits span chunks (the mapper
           // returns passively on !ok with an empty response); the #902
-          // CANCELED shape (ok + empty response) DOES ship a success finish,
-          // so it is excluded — retrying behind an already-served client
-          // would double-run. Any recorded step (text/reasoning/tool) may
-          // have streamed to the client: no replay.
-          const shapeOnly = last.resultEvent === null || (!last.resultEvent.ok && last.resultEvent.response === '')
+          // CANCELED shape (ok + empty response, nothing streamed) is
+          // retryable too — the mapper stays passive on it, so a retry is
+          // invisible to the client. Any recorded step (text/reasoning/tool)
+          // may have streamed to the client: no replay.
+          const canceledEmptyShape =
+            last.resultEvent !== null && last.resultEvent.ok && last.resultEvent.response === '' && !rec.sawTextBefore(rec.length)
+          const shapeOnly =
+            last.resultEvent === null ||
+            (!last.resultEvent.ok && last.resultEvent.response === '') ||
+            canceledEmptyShape
           const canRetry =
             last.failure !== null &&
             shapeOnly &&
