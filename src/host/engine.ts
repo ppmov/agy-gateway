@@ -21,7 +21,7 @@ import { randomUUID } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import PQueue from 'p-queue'
-import { Err, extractValidationUrl, hasStructuredContent, looksLikeAuthFailure, looksLikeHardRateLimit, looksLikeRateLimit, looksLikeValidationRequired, type GatewayConfig } from '../common/types.ts'
+import { Err, extractValidationUrl, hasStructuredContent, looksLikeAuthFailure, looksLikeEligibilityBlocked, looksLikeHardRateLimit, looksLikeRateLimit, looksLikeValidationRequired, type GatewayConfig } from '../common/types.ts'
 import { modelFamilyOf, type ManagedAccount, type ModelFamily } from '../common/pool-types.ts'
 import type { AccountPoolManager } from './pool.ts'
 import { diffConversations, snapshotConversations } from './discovery.ts'
@@ -1367,6 +1367,15 @@ export class AgyEngine {
           const detail = parser.stats.lastResultError ?? (outcome.stderrTail !== '' ? brief(outcome.stderrTail) : 'upstream requires re-validation (VALIDATION_REQUIRED)')
           const url = extractValidationUrl(detail)
           failure = { kind: 'error', code: Err.VALIDATION_REQUIRED, message: url !== undefined ? detail + ' (validation_url: ' + url + ')' : detail }
+        } else if (looksLikeEligibilityBlocked(rawErrText)) {
+          // Google eligibility/geo gate: the account cannot obtain a session
+          // (loadCodeAssist 502/Not Allowed, "not eligible for Antigravity",
+          // "User location is not supported"). Classified distinctly from a
+          // generic PROCESS_EXIT — which is retryable and re-spawns the same
+          // dead account — so the settle-time quarantine takes it out of
+          // rotation instead.
+          const detail = parser.stats.lastResultError ?? (outcome.stderrTail !== '' ? brief(outcome.stderrTail) : 'upstream eligibility/geo gate refused the account (ELIGIBILITY_BLOCKED)')
+          failure = { kind: 'error', code: Err.ELIGIBILITY_BLOCKED, message: detail }
         } else if (isRateLimit) {
           const bestMsg = parser.stats.lastResultError || (outcome.stderrTail ? brief(outcome.stderrTail) : 'Rate limit or quota reached')
           // gateway-patch: CLIProxyAPI 429-classifier drives the routing
@@ -1560,6 +1569,16 @@ export class AgyEngine {
           }
           if (last.account && (last.failure.code === Err.AUTH || last.failure.code === Err.VALIDATION_REQUIRED || /invalid_grant|not signed in|auth/i.test(last.failure.message))) {
             this.deps.pool?.markAuthRequired(last.account.id, last.failure.message)
+          }
+          // Eligibility/geo class (t_a5691f67): the credential is intact but
+          // the upstream gate refuses service. Distinct quarantine path (it is
+          // NOT auth drift): the pool counts a streak and quarantines only
+          // after repeated failures, so a single transient 502 does not exile
+          // a healthy account. Quarantined accounts are filtered out of
+          // selectAccount, so the next request never spends a full spawn on
+          // the dead credential.
+          if (last.account && last.failure.code === Err.ELIGIBILITY_BLOCKED) {
+            this.deps.pool?.recordEligibilityFailure(last.account.id, last.failure.message)
           }
           if (sessionAccountKey !== '') {
             if (

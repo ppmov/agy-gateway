@@ -184,6 +184,13 @@ export const Err = {
   POOL_EXHAUSTED: 'POOL_EXHAUSTED',
   /** Upstream 403 re-validation (validation_url rides the message) → 403. */
   VALIDATION_REQUIRED: 'VALIDATION_REQUIRED',
+  /** Google eligibility/geo gate (Antigravity): 'Eligibility check failed …
+   *  loadCodeAssist', 'not eligible for Antigravity', 'User location is not
+   *  supported for the API use'. The credential is intact but the upstream
+   *  gate refuses to issue a session — classified distinctly from a generic
+   *  PROCESS_EXIT so the account is quarantined out of rotation instead of
+   *  being re-spawned blindly. → 403. */
+  ELIGIBILITY_BLOCKED: 'ELIGIBILITY_BLOCKED',
   /** Per-key model whitelist violation (M5) → 403, both protocol tables. */
   MODEL_NOT_ALLOWED: 'MODEL_NOT_ALLOWED',
   /** The server gave up on a parked/queued request: client disconnect while
@@ -336,6 +343,20 @@ export function looksLikeRateLimit(text?: string): boolean {
  */
 export function looksLikeValidationRequired(text?: string): boolean {
   return !!text && /VALIDATION_REQUIRED/i.test(text)
+}
+
+/**
+ * Google's eligibility / geo gate (Antigravity): the account cannot obtain a
+ * session at all — `loadCodeAssist` fails ("Bad Gateway" / "Not Allowed"),
+ * "not eligible for Antigravity", or "User location is not supported for the
+ * API use". Distinct from AUTH (signed out) and VALIDATION_REQUIRED (challenge
+ * pending): the credential is intact, the upstream gate refuses service.
+ * Deliberately narrow — the phrases are server-issued; a bare "not eligible"
+ * is not enough (catalog code uses the word for account selection).
+ */
+export function looksLikeEligibilityBlocked(text?: string): boolean {
+  if (!text) return false
+  return /eligibility check failed|loadcodeassist|not eligible for antigravity|user location is not supported/i.test(text)
 }
 
 /** Extract the https challenge URL from a VALIDATION_REQUIRED failure text. */

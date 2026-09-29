@@ -72,6 +72,13 @@ export interface ManagedAccount {
   authRequired?: boolean
   /** Last authentication failure reason. */
   authError?: string
+  /**
+   * Eligibility/geo failure streak (t_a5691f67) — consecutive upstream
+   * eligibility refusals and the time of the last one. Drives the quarantine
+   * threshold in AccountPoolManager.recordEligibilityFailure; cleared by
+   * recordSuccess (and by clearAuthRequired, an explicit operator reset).
+   */
+  eligibilityFailures?: { consecutive: number; lastAt: number }
   /** Cooldown state tracked per model family. */
   cooldowns: Partial<Record<ModelFamily, FamilyCooldownState>>
   /** Cached real-time quota statistics per model family. */

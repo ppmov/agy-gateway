@@ -53,6 +53,7 @@ export function errorStatus(code: string): { statusCode: number; type: string } 
     case 'POOL_EXHAUSTED':
       return { statusCode: 429, type: 'rate_limit_error' }
     case 'VALIDATION_REQUIRED':
+    case 'ELIGIBILITY_BLOCKED':
     case 'MODEL_NOT_ALLOWED':
       return { statusCode: 403, type: 'permission_error' }
     case 'UNSUPPORTED_REASONING_EFFORT':
@@ -139,6 +140,7 @@ export function anthropicStatusFor(code: string, message: string): { statusCode:
     case 'POOL_EXHAUSTED':
       return { statusCode: 429, type: 'rate_limit_error' }
     case 'VALIDATION_REQUIRED':
+    case 'ELIGIBILITY_BLOCKED':
     case 'MODEL_NOT_ALLOWED':
       return { statusCode: 403, type: 'permission_error' }
     case 'UNSUPPORTED_REASONING_EFFORT':

@@ -216,6 +216,16 @@ if (mode === 'validation') {
   process.exit(1)
 }
 
+// Eligibility/geo gate (t_a5691f67): the real shape from the 29.09 ledger
+// series — stderr carries the loadCodeAssist refusal and the result envelope
+// repeats it; agy exits 1. Must classify as ELIGIBILITY_BLOCKED (NOT plain
+// PROCESS_EXIT) so the account leaves rotation instead of being re-spawned.
+if (mode === 'eligibility') {
+  process.stderr.write('Error: Eligibility check failed: loadCodeAssist: Bad Gateway\n')
+  emit({ event: 'result', result: { conversation_id: conv, status: 'ERROR', response: '', error: 'Eligibility check failed: loadCodeAssist: Bad Gateway', duration_seconds: 31.4, num_turns: 0, usage: { input_tokens: 0, output_tokens: 0 } } })
+  process.exit(1)
+}
+
 if (mode === 'exit12') {
   process.stderr.write('boom: fake crash\n')
   process.exit(12)

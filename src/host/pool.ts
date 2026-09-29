@@ -32,6 +32,16 @@ export function defaultPoolDir(): string {
 export const PERSIST_DEBOUNCE_MS = 500
 /** B4/S5: minimum gap between persist-failure warnings (one per minute). */
 const PERSIST_WARN_MS = 60_000
+/**
+ * Eligibility/geo class (t_a5691f67): how many CONSECUTIVE eligibility
+ * failures within ELIGIBILITY_STREAK_RESET_MS are needed before the account
+ * is quarantined out of rotation. 2 keeps a single transient upstream 502
+ * from exiling a healthy account while stopping the observed series (11
+ * logical requests → 22 blind spawns on one account within 2h).
+ */
+export const ELIGIBILITY_QUARANTINE_THRESHOLD = 2
+/** A gap longer than this between eligibility failures restarts the streak. */
+export const ELIGIBILITY_STREAK_RESET_MS = 30 * 60 * 1000
 
 export class AccountPoolManager {
   private data: AccountPoolData
@@ -353,6 +363,46 @@ export class AccountPoolManager {
     return true
   }
 
+  /**
+   * Quarantine gate for the eligibility/geo class (t_a5691f67): the account
+   * cannot obtain an upstream session (loadCodeAssist 502, "not eligible for
+   * Antigravity", "User location is not supported"). A SINGLE transient 502
+   * must not exile a healthy account, so the account leaves rotation only
+   * after ELIGIBILITY_QUARANTINE_THRESHOLD consecutive failures of the class
+   * within ELIGIBILITY_STREAK_RESET_MS; a success resets the streak. Once a
+   * quarantine is armed, a repeat of the class re-asserts it so a manual
+   * clearAuthRequired cannot flap the account back in without a success.
+   * Returns true when the account was (or remains) quarantined.
+   */
+  recordEligibilityFailure(id: string, reason: string): boolean {
+    const acc = this.getAccount(id)
+    if (!acc) return false
+    const now = Date.now()
+    const prev = acc.eligibilityFailures
+    const streak =
+      prev !== undefined && now - prev.lastAt <= ELIGIBILITY_STREAK_RESET_MS
+        ? prev.consecutive + 1
+        : 1
+    acc.eligibilityFailures = { consecutive: streak, lastAt: now }
+    const alreadyQuarantined = acc.authRequired === true && acc.authError === reason
+    if (streak >= ELIGIBILITY_QUARANTINE_THRESHOLD || acc.authRequired === true) {
+      acc.authRequired = true
+      acc.authError = reason
+      if (this.data.activeAccountIds) {
+        for (const [fam, accId] of Object.entries(this.data.activeAccountIds)) {
+          if (accId === id) delete this.data.activeAccountIds[fam as ModelFamily]
+        }
+      }
+      this.log?.(
+        `eligibility quarantine armed for account ${id} (streak ${streak}${alreadyQuarantined ? ', re-asserted' : ''}): ${reason}`,
+      )
+      this.persist()
+      return true
+    }
+    this.persistSoon()
+    return false
+  }
+
   markAuthRequired(id: string, reason?: string): void {
     const acc = this.getAccount(id)
     if (!acc) return
@@ -380,6 +430,7 @@ export class AccountPoolManager {
     if (!acc) return
     delete acc.authRequired
     delete acc.authError
+    delete acc.eligibilityFailures
     this.persist()
   }
 
@@ -397,6 +448,7 @@ export class AccountPoolManager {
     acc.quotas = {}
     delete acc.authRequired
     delete acc.authError
+    delete acc.eligibilityFailures
     this.persist()
   }
 
@@ -480,6 +532,7 @@ export class AccountPoolManager {
     if (acc.authRequired) {
       delete acc.authRequired
       delete acc.authError
+      delete acc.eligibilityFailures
     }
     if (acc.cooldowns[family]) {
       delete acc.cooldowns[family]
