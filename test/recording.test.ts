@@ -30,6 +30,18 @@ describe('RunRecording event cap (S-M6)', () => {
     expect(rec.hasResult).toBe(true)
   })
 
+  it('getResultEvent carries structured_output content through (the #902 emptiness call needs it)', () => {
+    // A tool-bridge answer arrives as `structured_output` with response === '':
+    // without this projection the engine would read the envelope as
+    // CANCELED-empty and retry a turn that actually holds the answer.
+    const rec = new RunRecording('r-structured')
+    rec.append({ kind: 'result', conversationId: 'c', ok: true, response: '', structuredOutput: { content: 'hi', tool_calls: [] }, usage: {} })
+    expect(rec.getResultEvent()).toEqual({ ok: true, response: '', structuredOutput: { content: 'hi', tool_calls: [] } })
+    // An unfilled envelope still rides along — its emptiness is judged upstream.
+    rec.append({ kind: 'result', conversationId: 'c', ok: true, response: '', structuredOutput: {}, usage: {} })
+    expect(rec.getResultEvent()).toEqual({ ok: true, response: '', structuredOutput: {} })
+  })
+
   it('step usage survives the cap for the final-usage preference', () => {
     const rec = new RunRecording('r-cap2')
     for (let i = 0; i < MAX_EVENTS_PER_RUN + 1; i++) {
