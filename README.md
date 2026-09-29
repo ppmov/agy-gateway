@@ -279,9 +279,15 @@ curl -s http://127.0.0.1:8300/healthz
 
 **⛔ ЗАПРЕТ `DELETE /admin/pool/accounts`:** upstream-реализация делает `rm -rf` каталога аккаунта (`account.dir`). Каталоги `/root/.agy-accounts/*` — только бэкап; удаление аккаунтов через admin-API не использовать.
 
-**Откат на star-cliproxy:**
+**Откат на star-cliproxy: НЕВОЗМОЖЕН — легаси-мост демонтирован (проверено 29.09.2026).**
+
+Факт: каталог `/opt/star-cliproxy` удалён, systemd-юнита `star-cliproxy` нет ни в `/etc/systemd/system`, ни в `/opt` (`systemctl is-enabled star-cliproxy` → `not-found`). Команда `systemctl enable --now star-cliproxy` невыполнима.
+
+Восстановление — только сборкой из upstream (не откатом):
 
 ```bash
-systemctl disable --now agy-gateway
-systemctl enable --now star-cliproxy
+git clone https://github.com/Sakiko15/agy-proxy.git /opt/star-cliproxy   # upstream
+# данные легаси-моста: /root/backups/star-cliproxy-backup-20260924/ (cliproxy.db, config.yaml)
+# текст прежнего юнита: /tmp/star-cliproxy.service.pre-switch
+systemctl disable --now agy-gateway    # освободить порт, если легаси-мост слушает тот же
 ```
