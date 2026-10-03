@@ -226,6 +226,30 @@ if (mode === 'eligibility') {
   process.exit(1)
 }
 
+// Phase 3 tool-bridge TIMING drill (t_03a5ca20): a completed native tool step
+// lands BEFORE the result envelope, so the raw span cuts while the run is still
+// live. The engine must wait for the envelope/settle instead of recutting an
+// empty recording (the spurious 'no result envelope' 502 for a run that then
+// finishes OK). FAKE_AGY_DELAY_MS stretches the gap between cut and envelope;
+// with a short run timeout the bounded wait expires and the caller must surface
+// a PROCESS_EXIT-class cause, never the structureless-answer text.
+if (mode === 'tool-cut') {
+  emit({ event: 'init', conversation_id: conv, model: 'gemini-3-6-flash' })
+  emit({ event: 'step_update', step_update: { conversation_id: conv, step_index: 1, state: 'DONE', step_type: 'tool', duration_seconds: 0.3, tool_name: 'read_file', tool_info: { name: 'read_file', parameters: { path: '/tmp/x' }, output: 'file contents here' } } })
+  await sleep(Number(process.env.FAKE_AGY_DELAY_MS ?? 300))
+  emit({ event: 'result', result: { conversation_id: conv, status: 'DONE', response: JSON.stringify({ content: 'tool cut answered', tool_calls: [] }), duration_seconds: 1, num_turns: 1, usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 } } })
+  process.exit(0)
+}
+
+// #902 CANCELED-empty drill (t_03a5ca20): status=CANCELED + empty response on
+// exit 0. The engine classifies it INVALID_OUTPUT with the #902 cause; the
+// bridge client must see THAT text — never a generic 'no result envelope'.
+if (mode === 'canceled-empty') {
+  emit({ event: 'init', conversation_id: conv, model: 'gemini-3-6-flash' })
+  emit({ event: 'result', result: { conversation_id: conv, status: 'CANCELED', response: '', duration_seconds: 30, num_turns: 0, usage: { input_tokens: 0, output_tokens: 0 } } })
+  process.exit(0)
+}
+
 if (mode === 'exit12') {
   process.stderr.write('boom: fake crash\n')
   process.exit(12)

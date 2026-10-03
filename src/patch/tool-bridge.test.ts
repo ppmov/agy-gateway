@@ -708,6 +708,38 @@ describe('TB-E2E: non-streaming', () => {
     expect(res.body).toContain('PROCESS_EXIT')
   })
 
+  it('native tool step BEFORE the result envelope → waits for settle, serves the real answer (no spurious 502)', async () => {
+    // t_03a5ca20: the raw span cuts on the first COMPLETED native tool step
+    // while the run is still live. The recut used to read the recording
+    // immediately — no envelope yet — and answer a run that then settles OK
+    // with a bogus 'no result envelope' 502. The bridge must wait for the
+    // result envelope and recut the real answer.
+    delete process.env.FAKE_AGY_EVENTS_FILE
+    process.env.FAKE_AGY_MODE = 'tool-cut'
+    process.env.FAKE_AGY_DELAY_MS = '500'
+    const s = track(makeServer())
+    const res = await postChat(s, chatPayload())
+    expect(res.statusCode).toBe(200)
+    const body = res.json() as { choices: Array<{ message: { content: string | null }; finish_reason: string }> }
+    expect(body.choices[0]!.message.content).toBe('tool cut answered')
+    expect(body.choices[0]!.finish_reason).toBe('stop')
+  })
+
+  it('#902 CANCELED-empty run → the CLIENT gets the #902 cause, not "no result envelope"', async () => {
+    // The recut must prefer rec.failureInfo (the engine's real classification:
+    // 'agy ended with an empty response (CANCELED, google antigravity #902)')
+    // over the generic structureless-answer text (postановка п.3c).
+    delete process.env.FAKE_AGY_EVENTS_FILE
+    process.env.FAKE_AGY_MODE = 'canceled-empty'
+    const s = track(makeServer())
+    const res = await postChat(s, chatPayload())
+    expect(res.statusCode).toBe(502)
+    const body = res.json() as { error?: { code?: string; message?: string } }
+    expect(body.error?.code).toBe('INVALID_OUTPUT')
+    expect(body.error?.message).toContain('902')
+    expect(body.error?.message).not.toContain('no result envelope')
+  })
+
   it('noise mode (non-JSON stdout) still parses the envelope', async () => {
     useEvents(bridgeEvents(JSON.stringify({ content: '', tool_calls: [{ name: 'get_weather', args: '{"city":"Moscow"}' }] })))
     process.env.FAKE_AGY_MODE = 'noise'

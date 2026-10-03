@@ -433,6 +433,11 @@ function lastResultResponse(rec: RunRecording, from: number): string | Record<st
  * recut is emitted). Returns the successful raw answer or the last error; the
  * recording keeps the LAST attempt only when it produced a usable answer, so
  * the caller can recut from the fresh events.
+ *
+ * Contract on the `undefined` input: NO retry is issued (the first guard
+ * returns it verbatim). That is deliberate — the caller only reaches the recut
+ * with `undefined` once the run has settled without an envelope (the wait for
+ * settle runs first, t_03a5ca20), so there is nothing left to respawn against.
  */
 async function respawnForToolBridge(
   engine: AgyEngine,
@@ -1627,12 +1632,36 @@ export class AgyEngine {
     if (bridgePolicy !== null && bridgePolicy.allowedNames.length > 0) {
       const buffered: StreamChunk[] = []
       const rawSpan = this.driveSpan(rec, 0, true)
+      let spanEnd: SpanEnd = { cutOnTool: false }
       for (;;) {
         const next = await rawSpan.next()
-        if (next.done === true) break
+        if (next.done === true) {
+          // driveSpan's return value (SpanEnd) — the ONLY signal that tells a
+          // tool-cut span from a finished one — used to be dropped here
+          // (`void buffered`), so a span that cut on the first completed
+          // native-tool-step WHILE THE RUN WAS STILL LIVE was handed straight
+          // to the recut: `lastResultResponse` found no envelope yet and the
+          // client got a spurious 'no usable answer (no result envelope)' 502
+          // for a run that then settled OK (t_03a5ca20).
+          spanEnd = next.value
+          break
+        }
         buffered.push(next.value)
       }
       void buffered
+      // A tool-cut span means the run may still be producing its result
+      // envelope: WAIT (bounded by the run timeout) for the envelope/settle
+      // before recutting, exactly like the continuation path waits on the
+      // recording. Without the wait the recut reads an empty recording and
+      // answers a live run with a spurious 'no result envelope' 502
+      // (t_03a5ca20). A wait that expires is surfaced as a TIMEOUT-class
+      // failure — never as the structureless-answer text, and never an
+      // unbounded park of the single agy slot.
+      if (spanEnd.cutOnTool && !rec.isSettled && !(await this.awaitRecordingSettle(rec, cfg.timeoutMs))) {
+        yield { type: 'usage', usage: { inputTokens: 0, outputTokens: 0 } }
+        yield { type: 'finish', reason: { kind: 'error', failure: { message: 'tool bridge: agy produced no result envelope within ' + cfg.timeoutMs + 'ms (run still live after tool cut)', code: Err.TIMEOUT } } }
+        return
+      }
       const raw = await respawnForToolBridge(this, rec, bridgePolicy, model, family, lastResultResponse(rec, 0))
       for (const ch of recutToolBridgeSpan(rec, raw, bridgePolicy, model)) {
         // Bridge turns never continue through the agy mirror cursor: the
@@ -1669,6 +1698,23 @@ export class AgyEngine {
    * (no pool account, spawn error, steer/abort): the caller then surfaces the
    * original 502-class failure, never a silent success.
    */
+  /**
+   * Wait (bounded) until the recording settles — the result envelope arrived
+   * or the run ended. Returns true when settled, false when the bound expired.
+   * The Phase 3 tool-bridge branch needs it: a span that cut on a completed
+   * native-tool-step leaves the run LIVE (the envelope is still to come), so
+   * the recut must not read the recording until settlement (t_03a5ca20).
+   */
+  private async awaitRecordingSettle(rec: RunRecording, timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + Math.max(1_000, timeoutMs)
+    for (;;) {
+      if (rec.isSettled) return true
+      const left = deadline - Date.now()
+      if (left <= 0) return rec.isSettled
+      await new Promise((r) => setTimeout(r, Math.min(50, left)))
+    }
+  }
+
   /** Wait (bounded) until no engine-spawned agy child is live. */
   private async waitForIdleAgy(timeoutMs = 30_000): Promise<void> {
     const deadline = Date.now() + timeoutMs
