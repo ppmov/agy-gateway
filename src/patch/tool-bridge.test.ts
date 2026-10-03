@@ -718,11 +718,16 @@ describe('TB-E2E: non-streaming', () => {
     process.env.FAKE_AGY_MODE = 'tool-cut'
     process.env.FAKE_AGY_DELAY_MS = '500'
     const s = track(makeServer())
+    const startedAt = Date.now()
     const res = await postChat(s, chatPayload())
+    const elapsed = Date.now() - startedAt
     expect(res.statusCode).toBe(200)
     const body = res.json() as { choices: Array<{ message: { content: string | null }; finish_reason: string }> }
     expect(body.choices[0]!.message.content).toBe('tool cut answered')
     expect(body.choices[0]!.finish_reason).toBe('stop')
+    // The response cannot have been produced BEFORE the envelope landed: the
+    // client answers no earlier than the fake's post-tool gap (settle).
+    expect(elapsed).toBeGreaterThanOrEqual(450)
   })
 
   it('#902 CANCELED-empty run → the CLIENT gets the #902 cause, not "no result envelope"', async () => {
