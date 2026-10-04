@@ -227,6 +227,32 @@ if (mode === 'rate-limit-delayed') {
   process.exit(Number(process.env.FAKE_AGY_EXIT_CODE ?? '1'))
 }
 
+// t_1e2de674 rework (#11079) bridge-respawn drill: the FIRST spawn returns a
+// broken envelope (an unstructured answer → the tool bridge wants a respawn),
+// the respawn then hits a delayed hard quota. The respawn must carry the live
+// stderr detector too: kill at the line, surface the QUOTA class (not the
+// generic shape error) and cool the account. FAKE_AGY_BRIDGE_QUOTA_SEQ_FILE
+// makes the first spawn 'broken' and every later spawn 'rate-limit-delayed'
+// from the SAME process without parent-side coordination.
+if (process.env.FAKE_AGY_EVENTS_FILES === undefined && process.env.FAKE_AGY_BRIDGE_QUOTA_SEQ_FILE) {
+  const seqFile = process.env.FAKE_AGY_BRIDGE_QUOTA_SEQ_FILE
+  let n = 0
+  try { n = Number(readFileSync(seqFile, 'utf8').trim()) || 0 } catch { n = 0 }
+  try { writeFileSync(seqFile, String(n + 1)) } catch {}
+  if (n === 0) {
+    emit({ event: 'init', conversation_id: conv, model: 'gemini-3-6-flash' })
+    emit({ event: 'result', result: { conversation_id: conv, status: 'DONE', response: 'this is not a json envelope at all', duration_seconds: 1, num_turns: 1, usage: { input_tokens: 5, output_tokens: 5 } } })
+    process.exit(0)
+  }
+  emit({ event: 'init', conversation_id: conv, model: 'gemini-3-6-flash' })
+  await sleep(Number(process.env.FAKE_AGY_QUOTA_AFTER_MS ?? 1_500))
+  process.stderr.write('API error (attempt 1): RESOURCE_EXHAUSTED (code 429): Individual quota reached for model gemini-3-6-flash. Retrying...\n')
+  await sleep(Number(process.env.FAKE_AGY_QUOTA_RETRY_MS ?? 20_000))
+  process.stderr.write('Error: 429 RESOURCE_EXHAUSTED - Individual quota reached for model gemini-3-6-flash. Resets in 21m25s.\n')
+  emit({ event: 'result', result: { conversation_id: conv, status: 'ERROR', response: '', error: '429 RESOURCE_EXHAUSTED: Individual quota reached for this model. Resets in 21m25s.', duration_seconds: 0.1, num_turns: 0, usage: { input_tokens: 0, output_tokens: 0 } } })
+  process.exit(Number(process.env.FAKE_AGY_EXIT_CODE ?? '1'))
+}
+
 if (mode === 'validation') {
   process.stderr.write('Error: 403 VALIDATION_REQUIRED - additional verification is required for this account\n')
   emit({ event: 'result', result: { conversation_id: conv, status: 'ERROR', response: '', error: '403 VALIDATION_REQUIRED - your account requires additional verification: https://accounts.google.com/signin/v2/challenge/validation?continue=https%3A%2F%2Fantigravity.google', duration_seconds: 0.1, num_turns: 0, usage: { input_tokens: 0, output_tokens: 0 } } })

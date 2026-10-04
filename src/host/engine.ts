@@ -363,6 +363,19 @@ function* recutToolBridgeSpan(
     { type: 'finish', reason: { kind: 'error', failure: { message: err.message, code: err.code === 'prompt_overflow' ? Err.PROMPT_OVERFLOW : err.code === 'invalid_tools' ? Err.INVALID_TOOLS : Err.INVALID_OUTPUT } } },
   ]
 
+  // A tool-bridge respawn that aborted on a LIVE hard quota (t_1e2de674 rework
+  // #11079) settles the run with the quota class; surface THAT — the real
+  // upstream cause with the right routing code — instead of parsing the broken
+  // shape answer the aborted spawn left behind.
+  if (rec.bridgeQuotaFailure) {
+    const f = rec.failureInfo
+    if (f !== null) {
+      yield { type: 'usage', usage: { inputTokens: 0, outputTokens: 0 } }
+      yield { type: 'finish', reason: f.kind === 'aborted' ? { kind: 'aborted', failure: { message: f.message, code: f.code } } : { kind: 'error', failure: { message: f.message, code: f.code } } }
+      return
+    }
+  }
+
   if (raw === undefined) {
     // No result envelope: the run failed upstream (quota/auth/process/empty).
     // Surfacing NOTHING here would produce an empty 200 — the exact silent
@@ -1847,10 +1860,18 @@ export class AgyEngine {
           freshResponse = ev.response
         }
       }
+      // t_1e2de674 rework (#11079): the FIRST attempt already carries the live
+      // stderr quota detector (runOnce), but this EXTRA bridge respawn used to
+      // lack it — a hard quota here held the single agy slot for the whole
+      // ~150s agy-internal retry and left the exhausted account uncooled. The
+      // same narrow HARD-only detector now guards this spawn too.
+      let quotaReachedLive = false
+      let quotaErrText = ''
       const spawn = async (): Promise<boolean> => {
         this.liveAgyChildren++
         try {
-          const proc = startAgyProcess({
+          let proc: ReturnType<typeof startAgyProcess> | undefined
+          proc = startAgyProcess({
             bin,
             // binArgs is the harness seam (node + fake-agy script); production
             // leaves it empty. Dropping it here made the retry spawn a binary
@@ -1867,6 +1888,17 @@ export class AgyEngine {
                 rec.append(ev)
               }
             },
+            // Live quota fast-fail, mirroring runOnce: kill the spawn the moment
+            // a HARD quota signature lands on stderr (the classification below
+            // forces the quota branch so the account is cooled, not left in
+            // rotation).
+            onStderr: (line) => {
+              if (!quotaReachedLive && looksLikeHardRateLimit(line)) {
+                quotaReachedLive = true
+                quotaErrText = line
+                proc?.kill('abort')
+              }
+            },
           })
           const outcome = await proc.outcome
           for (const ev of parser.flush()) {
@@ -1880,6 +1912,23 @@ export class AgyEngine {
       }
       const q = account != null ? this.accountQueues.get(account.id) : undefined
       const ok = q !== undefined ? await q.add(spawn) : await spawn()
+      if (quotaReachedLive) {
+        // The respawn hit a hard quota: surface the real upstream class through
+        // the settled recording (the recut prefers it over the shape error) and
+        // cool the account on the settle-time path — exactly as runOnce does.
+        // Returning `undefined` also halts the bridge retry loop: a quota is not
+        // a probabilistic shape flake, so no further spawn is burned.
+        const bestMsg = quotaErrText || 'Rate limit or quota reached'
+        const d429 = gatewayPatch.classifyAgy429(bestMsg)
+        rec.setFailure({
+          kind: 'error',
+          code: Err.AGY_ERROR,
+          message: 'Google Antigravity quota / rate limit reached (' + d429.kind + '): ' + bestMsg,
+        })
+        rec.bridgeQuotaFailure = true
+        if (account != null) this.applyRateLimitCooldown(account.id, family, bestMsg)
+        return undefined
+      }
       if (!ok || freshResponse === undefined) return undefined
       return freshResponse
     } catch {

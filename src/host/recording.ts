@@ -120,6 +120,27 @@ export class RunRecording {
     this.wake()
   }
 
+  /**
+   * Overwrite the terminal failure of an already-settled recording, WITHOUT
+   * touching event indices or the settled flag. Used by the tool-bridge respawn
+   * (t_1e2de674 rework #11079): the run settled OK on its first attempt, then
+   * the EXTRA respawn spawn hit a hard quota. Recording the quota class here
+   * lets the shape-recut surface the real upstream cause and cool the account,
+   * instead of masking it behind a generic tool-bridge shape error.
+   */
+  setFailure(failure: RecordingFailure): void {
+    this.failure = failure
+    this.wake()
+  }
+
+  /**
+   * Set by the tool-bridge respawn when its spawn aborted on a live hard quota
+   * (t_1e2de674 rework #11079). The recut must then surface `failureInfo` for
+   * the client even though a (broken) raw answer is still present — the quota
+   * is the real cause, not the tool-bridge shape it produced.
+   */
+  bridgeQuotaFailure = false
+
   private wake(): void {
     for (const w of this[waiters]) w()
     this[waiters].clear()

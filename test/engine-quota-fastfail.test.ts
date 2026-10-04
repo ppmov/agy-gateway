@@ -29,7 +29,7 @@ import { defaultConfig, Err } from '../src/common/types.ts'
 const fakeBin = process.execPath
 const fakeScript = join(import.meta.dirname, 'fake-agy.mjs')
 const dirs: string[] = []
-const ENV_KEYS = ['FAKE_AGY_MODE', 'FAKE_AGY_MODE_FILE', 'FAKE_AGY_ARGS_FILE', 'FAKE_AGY_FAIL_HOME', 'FAKE_AGY_QUOTA_AFTER_MS', 'FAKE_AGY_QUOTA_RETRY_MS'] as const
+const ENV_KEYS = ['FAKE_AGY_MODE', 'FAKE_AGY_MODE_FILE', 'FAKE_AGY_ARGS_FILE', 'FAKE_AGY_FAIL_HOME', 'FAKE_AGY_QUOTA_AFTER_MS', 'FAKE_AGY_QUOTA_RETRY_MS', 'FAKE_AGY_BRIDGE_QUOTA_SEQ_FILE'] as const
 
 afterEach(() => {
   for (const dir of dirs.splice(0)) {
@@ -59,6 +59,7 @@ function finishOf(chunks: StreamChunk[]): { reason: { kind: string; failure?: { 
 interface Harness {
   engine: AgyEngine
   pool: AccountPoolManager
+  dir: string
   setMode: (mode: string) => void
   onRunCalls: OnRunInfo[]
 }
@@ -92,7 +93,7 @@ function mk(): Harness {
     onRun: (i) => { onRunCalls.push(i) },
     retryDelay: async () => {},
   })
-  return { engine, pool, setMode: (m) => writeFileSync(modeFile, m + '\n'), onRunCalls }
+  return { engine, pool, dir, setMode: (m) => writeFileSync(modeFile, m + '\n'), onRunCalls }
 }
 
 describe('t_1e2de674: live quota fast-fail', () => {
@@ -134,5 +135,38 @@ describe('t_1e2de674: live quota fast-fail', () => {
     expect(fin.reason.kind).toBe('error')
     expect(fin.reason.failure?.code).toBe(Err.AGY_ERROR)
     expect(fin.reason.failure?.message ?? '').toContain('quota')
+  }, 30_000)
+
+  it('rework #11079: the tool-bridge RESPAWN carries the live detector — hard quota there is fast (not ~150s), quota-classed, account cooled', async () => {
+    // First spawn answers with an unstructured envelope (the bridge wants a
+    // shape respawn); the respawn then hits a delayed hard quota. Without the
+    // detector on the respawn the client waits the whole 20s fake retry and the
+    // account is never cooled (the tester's #11079 defect).
+    const h = mk()
+    const first = h.pool.getAccounts()[0]!
+    const seq = join(h.dir, 'bridge-quota-seq')
+    writeFileSync(seq, '0')
+    process.env.FAKE_AGY_BRIDGE_QUOTA_SEQ_FILE = seq
+    process.env.FAKE_AGY_QUOTA_AFTER_MS = '1500'
+    process.env.FAKE_AGY_QUOTA_RETRY_MS = '20000'
+    // A client function tools[] is what triggers the bridge path.
+    const started = Date.now()
+    const chunks = await collect(
+      h.engine.stream({
+        model: 'gemini-3.7-flash',
+        messages: [msg('user', 'bridge ask')],
+        tools: [{ type: 'function', function: { name: 'get_weather', parameters: { type: 'object' } } }],
+      }),
+    )
+    const elapsed = Date.now() - started
+    expect(elapsed).toBeLessThan(6000)
+    const fin = finishOf(chunks)
+    expect(fin.reason.kind).toBe('error')
+    // The QUOTA class, not the generic tool-bridge shape error.
+    expect(fin.reason.failure?.code).toBe(Err.AGY_ERROR)
+    expect(fin.reason.failure?.message ?? '').toContain('quota')
+    await vi.waitFor(() => {
+      expect(h.pool.getAccount(first.id)?.cooldowns.google).toBeDefined()
+    }, { timeout: 5_000, interval: 20 })
   }, 30_000)
 })
