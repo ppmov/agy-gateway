@@ -305,7 +305,7 @@ export function buildServer(deps: ServerDeps): BuiltServer {
         return
       }
       const chunks: StreamChunk[] = []
-      for await (const ch of deps.engine.stream(withCallMeta(request, call, 'openai', cfg, readImage))) {
+      for await (const ch of deps.engine.stream({ ...withCallMeta(request, call, 'openai', cfg, readImage), signal: abort.signal })) {
         chunks.push(ch)
       }
       const collected = collectChunks(chunks)
@@ -387,7 +387,7 @@ export function buildServer(deps: ServerDeps): BuiltServer {
         return
       }
       const chunks: StreamChunk[] = []
-      for await (const ch of deps.engine.stream(withCallMeta(request, call, 'anthropic', cfg, readImage))) {
+      for await (const ch of deps.engine.stream({ ...withCallMeta(request, call, 'anthropic', cfg, readImage), signal: abort.signal })) {
         chunks.push(ch)
       }
       const collected = collectAnthropicChunks(chunks)
