@@ -7,7 +7,7 @@
 // file between attempts — file-based mode flipping is also what the soak
 // harness drives.
 import { describe, it, expect, afterEach, vi } from 'vitest'
-import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { AgyEngine, computeRetryDelayMs, RETRY_POLICY, type EngineCall, type EngineDeps, type EngineMessage } from '../src/host/engine.ts'
@@ -24,7 +24,7 @@ const fakeBin = process.execPath
 const fakeScript = join(import.meta.dirname, 'fake-agy.mjs')
 
 const dirs: string[] = []
-const ENV_KEYS = ['FAKE_AGY_MODE', 'FAKE_AGY_MODE_FILE', 'FAKE_AGY_ARGS_FILE', 'FAKE_AGY_EVENTS_FILE', 'FAKE_AGY_EVENTS_FILES', 'FAKE_AGY_EVENTS_SEQ_FILE', 'FAKE_AGY_EXIT_CODE'] as const
+const ENV_KEYS = ['FAKE_AGY_MODE', 'FAKE_AGY_MODE_FILE', 'FAKE_AGY_ARGS_FILE', 'FAKE_AGY_EVENTS_FILE', 'FAKE_AGY_EVENTS_FILES', 'FAKE_AGY_EVENTS_SEQ_FILE', 'FAKE_AGY_EXIT_CODE', 'FAKE_AGY_DELAY_MS', 'FAKE_AGY_SILENCE_MS'] as const
 
 afterEach(() => {
   for (const dir of dirs.splice(0)) {
@@ -573,5 +573,80 @@ describe('busy-aware spread (engine-level tracking, M5 drill fix)', () => {
     expect(new Set(onRunCalls.map((c) => c.accountId)).size).toBe(3)
     for (const c of onRunCalls) expect(c.ok).toBe(true)
     delete process.env.FAKE_AGY_MODE
+  })
+})
+
+describe('retry client-visible latency budget (t_67b7936c D.2)', () => {
+  it('two spawns in a row keep the final answer under 180s (retryable failure, then a rescue)', async () => {
+    // The card's acceptance criterion: no client request waits past ~3min
+    // because of two consecutive spawns on a failing account. Drive the real
+    // retry path (retryable CANCELED-empty shape on attempt 0, an answer on
+    // attempt 1) with each spawn stretched so the measured span is live, and
+    // sleep the REAL policy delay — the number asserted is the true
+    // client-visible latency, not a seam-accelerated approximation.
+    const dir = mkdtempSync(join(tmpdir(), 'agy-retry-latency-'))
+    dirs.push(dir)
+    process.env.AGY_PROXY_CONVERSATIONS_DIR = join(dir, 'convs')
+    const canceled = join(dir, 'canceled.ndjson')
+    appendFileSync(canceled, JSON.stringify({ event: 'init', conversation_id: 'c-x', model: 'gemini' }) + '\n')
+    appendFileSync(canceled, JSON.stringify({ event: 'result', result: { conversation_id: 'c-x', status: 'CANCELED', response: '', usage: { input_tokens: 3, output_tokens: 0 } } }) + '\n')
+    const recovered = join(dir, 'recovered.ndjson')
+    appendFileSync(recovered, JSON.stringify({ event: 'init', conversation_id: 'c-y', model: 'gemini' }) + '\n')
+    appendFileSync(recovered, JSON.stringify({ event: 'result', result: { conversation_id: 'c-y', status: 'SUCCESS', response: 'recovered answer', usage: { input_tokens: 3, output_tokens: 4 } } }) + '\n')
+    process.env.FAKE_AGY_EVENTS_FILES = canceled + ',' + recovered
+    process.env.FAKE_AGY_EVENTS_SEQ_FILE = join(dir, 'fake-seq')
+    process.env.FAKE_AGY_EXIT_CODE = '0'
+    process.env.FAKE_AGY_ARGS_FILE = join(dir, 'args.jsonl')
+    const perSpawnMs = 400
+    process.env.FAKE_AGY_DELAY_MS = String(perSpawnMs)
+    // A permissive run timeout: the point is that the client span stays
+    // bounded, not that the watchdog fires.
+    const cfg: GatewayConfig = { ...defaultConfig(), permissionMode: 'plan', timeoutMs: 170_000 }
+    const engine = new AgyEngine({
+      getConfig: () => cfg,
+      catalog: new ModelCatalog(async () => { throw new Error('no discovery in tests') }, cfg.fallbackModels, 300_000),
+      store: new SessionStore(join(dir, 'sessions.json')),
+      bin: () => process.execPath,
+      binArgs: [fakeScript],
+      acquire: () => Promise.resolve(() => {}),
+      runs: new RunRegistry(),
+      retryDelay: async (ms) => { await new Promise((r) => setTimeout(r, ms)) },
+    })
+    const started = Date.now()
+    const chunks = await collect(engine.stream(call([msg('user', 'hi')])))
+    const elapsed = Date.now() - started
+    const finish = finishOf(chunks)
+    expect(finish.reason.kind).toBe('stop')
+    expect(textOf(chunks)).toContain('recovered answer')
+    const spawnCount = readFileSync(process.env.FAKE_AGY_ARGS_FILE as string, 'utf8').split('\n').filter((l) => l.trim() !== '').length
+    expect(spawnCount).toBe(2) // exactly two spawns — the failure then the rescue
+    // Sanity: the measurement is live (both spawn delays + the policy retry
+    // delay were actually awaited), so the upper bound below is meaningful.
+    expect(elapsed).toBeGreaterThanOrEqual(2 * perSpawnMs + RETRY_POLICY.initialDelayMs)
+    expect(elapsed).toBeLessThan(180_000)
+  })
+})
+
+describe('one retry implementation (t_986df01a D.4)', () => {
+  it('the dead patch-helper retry is gone and the prod path is the ONLY implementation', () => {
+    // The defect (t_986df01a): a second, dead retry mechanism
+    // (withToolBridgeRetries / maxToolBridgeAttempts) drifted away from the
+    // live prod path (engine.respawnForToolBridge). This invariant fails if
+    // that helper (or another prod-side retry entry point) reappears.
+    const srcDir = join(import.meta.dirname, '..', 'src')
+    const files = (readdirSync(srcDir, { recursive: true, encoding: 'utf8' }) as string[]).filter((f) => f.endsWith('.ts'))
+    let deadHelper = 0
+    let deadExport = 0
+    let prodRetryEntry = 0
+    for (const rel of files) {
+      const text = readFileSync(join(srcDir, rel), 'utf8')
+      deadHelper += (text.match(/withToolBridgeRetries/g) ?? []).length
+      deadExport += (text.match(/maxToolBridgeAttempts/g) ?? []).length
+      prodRetryEntry += (text.match(/function respawnForToolBridge/g) ?? []).length
+    }
+    expect(files.length).toBeGreaterThan(0) // the scan actually ran
+    expect(deadHelper).toBe(0)
+    expect(deadExport).toBe(0)
+    expect(prodRetryEntry).toBe(1)
   })
 })
