@@ -40,7 +40,6 @@ import { MIRROR_TOOL_NAME } from './mirror.ts'
 import {
   buildToolBridgePrompt,
   buildToolBridgeResponseSchema,
-  maxToolBridgeAttempts,
   needsToolBridgeFollowUp,
   parseToolBridgeAnswer,
   isRetryableToolBridgeError,
@@ -1523,14 +1522,20 @@ export class AgyEngine {
             fireRun(last, attempt, true) // the aborted settle still books exactly one final event
             break
           }
-          // Same sticky selection as the first spawn, for the fixed family.
-          // A retryable failure never touches account state, so this normally
-          // returns the same account (now un-busy); an operator disable
-          // mid-flight keeps the settled failure instead of a secondhand
-          // POOL_EXHAUSTED.
+          // Same sticky selection as the first spawn, for the fixed family, but
+          // the account that just FAILED is excluded like a busy one
+          // (t_67b7936c): a retryable failure never touches account state, so a
+          // plain re-select used to hand the same account back and one broken
+          // account doubled the client's wait on a deterministic failure.
+          // When the failed account is the only healthy candidate the pool's
+          // busy-less fallback still returns it (a single-account pool keeps
+          // its self-healing retry); an operator disable mid-flight keeps the
+          // settled failure instead of a secondhand POOL_EXHAUSTED.
           if ((this.deps.pool?.getAccounts().length ?? 0) > 0) {
             this.untrackBusy(attemptAccount?.id)
-            const next = this.selectAccountFor(family, this.busyAccounts) ?? undefined
+            const retryBusy = new Set(this.busyAccounts)
+            if (attemptAccount != null) retryBusy.add(attemptAccount.id)
+            const next = this.selectAccountFor(family, retryBusy) ?? undefined
             if (next === undefined) {
               this.trackBusy(attemptAccount?.id)
               break

@@ -34,7 +34,6 @@ import {
   extractJsonObject,
   isAgyPromptOverflow,
   isRetryableToolBridgeError,
-  maxToolBridgeAttempts,
   newToolCallId,
   parseToolBridgeAnswer,
   parseToolBridgeEnvelope,
@@ -42,7 +41,6 @@ import {
   toOpenAiToolCalls,
   TOOL_BRIDGE_MAX_RETRIES,
   ToolBridgeError,
-  withToolBridgeRetries,
   type OpenAiFunctionTool,
 } from './tool-bridge.ts'
 
@@ -375,31 +373,6 @@ describe('TB-UNIT: answer parsing', () => {
 describe('TB-UNIT: retry loop', () => {
   const policy = resolveToolBridgePolicy(TOOLS_BODY, undefined, [])
 
-  it('retries up to 2 times and returns the good answer on the second attempt', async () => {
-    let asks = 0
-    const retries: number[] = []
-    const { result, attempts } = await withToolBridgeRetries('not json at all', policy, async () => {
-      asks++
-      return JSON.stringify({ content: '', tool_calls: [{ name: 'get_weather', args: '{"city":"Moscow"}' }] })
-    }, { onRetry: (n: number) => retries.push(n) })
-    expect(asks).toBe(1)
-    expect(retries).toEqual([1])
-    expect(attempts).toBe(2)
-    expect(result.toolCalls).toHaveLength(1)
-  })
-
-  it('gives up after TOOL_BRIDGE_MAX_RETRIES and rethrows the last error', async () => {
-    let asks = 0
-    await expect(
-      withToolBridgeRetries('broken', policy, async () => {
-        asks++
-        return 'still broken'
-      }),
-    ).rejects.toBeInstanceOf(ToolBridgeError)
-    expect(asks).toBe(TOOL_BRIDGE_MAX_RETRIES)
-    expect(maxToolBridgeAttempts()).toBe(3)
-  })
-
   it('does not retry a client-side tools[] error', async () => {
     let asks = 0
     // The policy constructor throws synchronously — that is the point: a
@@ -473,17 +446,6 @@ describe('TB-UNIT: prompt overflow classification (Phase 4 fix A-1)', () => {
     )
     expect(res.content).toBe('The log said: prompt is too long')
     expect(res.finishReason).toBe('stop')
-  })
-
-  it('does not retry an overflow answer inside the retry loop', async () => {
-    let asks = 0
-    await expect(
-      withToolBridgeRetries('Error: prompt is too long for this model', policy, async () => {
-        asks++
-        return JSON.stringify({ content: 'ok', tool_calls: [] })
-      }),
-    ).rejects.toMatchObject({ code: 'prompt_overflow', status: 413 })
-    expect(asks).toBe(0) // terminal on the FIRST sight — no retry spawn
   })
 
   it('agyOverflowCause finds the cause in failure-channel texts, not in prose', () => {

@@ -146,11 +146,6 @@ export class ToolBridgeError extends Error {
 /** Up to this many RETRIES (so 1 initial attempt + 2 retries) on a broken envelope. */
 export const TOOL_BRIDGE_MAX_RETRIES = 2
 
-/** How many times the engine must ask agy again for a given bridge turn. */
-export function maxToolBridgeAttempts(): number {
-  return TOOL_BRIDGE_MAX_RETRIES + 1
-}
-
 /** Whether an error is worth retrying (a probabilistic model failure). */
 export function isRetryableToolBridgeError(err: unknown): boolean {
   if (err instanceof ToolBridgeError) {
@@ -594,38 +589,8 @@ export function parseToolBridgeAnswer(raw: string | Record<string, unknown>, pol
 /** Alias kept for symfony with the reference repo naming. */
 export const parseToolBridgeOutput = parseToolBridgeAnswer
 
-// ---------------------------------------------------------------------------
-// Retry loop (point (г))
-// ---------------------------------------------------------------------------
-
 /**
- * Take an answer, parse it, and retry `ask()` up to TOOL_BRIDGE_MAX_RETRIES
- * times while the failure is `invalid_output`. The initial answer still counts
- * as attempt 1 (so at most 3 model answers per turn). `onRetry` observes every
- * retry (logs / tests); the final failure is thrown, never returned.
- */
-export async function withToolBridgeRetries(
-  initialRaw: string,
-  policy: ToolBridgePolicy,
-  ask: () => Promise<string>,
-  opts: { model?: string; onRetry?: (attempt: number, err: unknown) => void } = {},
-): Promise<{ result: ToolBridgeResult; attempts: number }> {
-  let raw = initialRaw
-  let lastErr: unknown
-  for (let attempt = 0; attempt <= TOOL_BRIDGE_MAX_RETRIES; attempt++) {
-    try {
-      return { result: parseToolBridgeAnswer(raw, policy, opts.model), attempts: attempt + 1 }
-    } catch (err) {
-      lastErr = err
-      if (!isRetryableToolBridgeError(err) || attempt === TOOL_BRIDGE_MAX_RETRIES) break
-      opts.onRetry?.(attempt + 1, err)
-      raw = await ask()
-    }
-  }
-  throw lastErr
-}
-
-/** Whether the turn that just produced `envelope` asks for more work. */
+ * Whether the turn that just produced `envelope` asks for more work. */
 export function needsToolBridgeFollowUp(envelope: unknown): boolean {
   return (
     envelope !== null &&

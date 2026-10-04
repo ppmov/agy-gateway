@@ -11,6 +11,7 @@ import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFil
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { AgyEngine, computeRetryDelayMs, RETRY_POLICY, type EngineCall, type EngineDeps, type EngineMessage } from '../src/host/engine.ts'
+import { TOOL_BRIDGE_MAX_RETRIES } from '../src/patch/tool-bridge.ts'
 import { ModelCatalog } from '../src/host/models.ts'
 import { SessionStore } from '../src/host/sessions.ts'
 import { RunRegistry } from '../src/host/recording.ts'
@@ -421,6 +422,124 @@ describe('computeRetryDelayMs (pure backoff math)', () => {
     expect(computeRetryDelayMs(50_000, () => 0)).toBe(RETRY_POLICY.maxDelayMs)
   })
 })
+describe('retry account exclusion (t_67b7936c)', () => {
+  it('a retryable failure retries on a DIFFERENT account — the failed account is not re-burned', async () => {
+    // The defect: the retry re-selected the SAME sticky account (the failure
+    // touched no account state), so one broken account doubled the client's
+    // wait on a deterministic failure. The retry must move to another healthy
+    // account when the pool has one.
+    const dir = mkdtempSync(join(tmpdir(), 'agy-retry-acct-'))
+    dirs.push(dir)
+    process.env.AGY_PROXY_CONVERSATIONS_DIR = join(dir, 'convs')
+    const modeFile = join(dir, 'fake-mode')
+    process.env.FAKE_AGY_MODE_FILE = modeFile
+    writeFileSync(modeFile, 'exit-error\n')
+    const cfg: GatewayConfig = { ...defaultConfig(), permissionMode: 'plan', timeoutMs: 5_000 }
+    const pool = new AccountPoolManager(join(dir, 'accounts'))
+    for (const alias of ['a0', 'a1', 'a2']) pool.createAccountSlot(alias)
+    const onRunCalls: OnRunInfo[] = []
+    const engine = new AgyEngine({
+      getConfig: () => cfg,
+      catalog: new ModelCatalog(async () => { throw new Error('no discovery in tests') }, cfg.fallbackModels, 300_000),
+      store: new SessionStore(join(dir, 'sessions.json')),
+      pool,
+      bin: () => fakeBin,
+      binArgs: [fakeScript],
+      acquire: () => Promise.resolve(() => {}),
+      runs: new RunRegistry(),
+      onRun: (i) => { onRunCalls.push(i) },
+      retryDelay: async () => { writeFileSync(modeFile, 'ok\n') }, // the retry finds a healthy run
+    })
+    for await (const _ of engine.stream(call([msg('user', 'hi')]))) void _
+    await vi.waitFor(() => {
+      expect(onRunCalls).toHaveLength(2)
+      expect(onRunCalls[0]).toMatchObject({ attempt: 0, final: false, ok: false })
+      expect(onRunCalls[1]).toMatchObject({ attempt: 1, final: true, ok: true })
+    }, { timeout: 5_000, interval: 10 })
+    // Same family, DIFFERENT account on the retry.
+    expect(onRunCalls[1]?.accountId).not.toBe(onRunCalls[0]?.accountId)
+    expect(onRunCalls[0]?.accountId).toBeTruthy()
+    expect(onRunCalls[1]?.accountId).toBeTruthy()
+  })
+
+  it('a single-account pool still retries on the same account (self-healing preserved)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'agy-retry-solo-'))
+    dirs.push(dir)
+    process.env.AGY_PROXY_CONVERSATIONS_DIR = join(dir, 'convs')
+    const modeFile = join(dir, 'fake-mode')
+    process.env.FAKE_AGY_MODE_FILE = modeFile
+    writeFileSync(modeFile, 'exit-error\n')
+    const cfg: GatewayConfig = { ...defaultConfig(), permissionMode: 'plan', timeoutMs: 5_000 }
+    const pool = new AccountPoolManager(join(dir, 'accounts'))
+    pool.createAccountSlot('only')
+    const onRunCalls: OnRunInfo[] = []
+    const engine = new AgyEngine({
+      getConfig: () => cfg,
+      catalog: new ModelCatalog(async () => { throw new Error('no discovery in tests') }, cfg.fallbackModels, 300_000),
+      store: new SessionStore(join(dir, 'sessions.json')),
+      pool,
+      bin: () => fakeBin,
+      binArgs: [fakeScript],
+      acquire: () => Promise.resolve(() => {}),
+      runs: new RunRegistry(),
+      onRun: (i) => { onRunCalls.push(i) },
+      retryDelay: async () => { writeFileSync(modeFile, 'ok\n') },
+    })
+    for await (const _ of engine.stream(call([msg('user', 'hi')]))) void _
+    await vi.waitFor(() => {
+      expect(onRunCalls).toHaveLength(2)
+      expect(onRunCalls[1]).toMatchObject({ attempt: 1, final: true, ok: true })
+    }, { timeout: 5_000, interval: 10 })
+    expect(onRunCalls[1]?.accountId).toBe(onRunCalls[0]?.accountId)
+  })
+})
+describe('tool-bridge prod-path retry (t_986df01a blind spot)', () => {
+  it('a broken envelope retries the PROD path at most TOOL_BRIDGE_MAX_RETRIES times and leaks no intermediate attempt', async () => {
+    // The prod retry lives in respawnForToolBridge (engine.ts), not in the
+    // deleted patch helper — it had NO test, which is how the two mechanisms
+    // drifted. Drive the real bridge path (client function tools present) with
+    // an unstructured answer and pin the spawn budget + invisibility.
+    const dir = mkdtempSync(join(tmpdir(), 'agy-bridge-retry-'))
+    dirs.push(dir)
+    process.env.AGY_PROXY_CONVERSATIONS_DIR = join(dir, 'convs')
+    const broken = join(dir, 'broken-envelope.ndjson')
+    appendFileSync(broken, JSON.stringify({ event: 'init', conversation_id: 'c-b', model: 'gemini-3-7-flash' }) + '\n')
+    appendFileSync(broken, JSON.stringify({ event: 'result', result: { conversation_id: 'c-b', status: 'DONE', response: 'this is not a json envelope at all', duration_seconds: 1, num_turns: 1, usage: { input_tokens: 5, output_tokens: 5 } } }) + '\n')
+    process.env.FAKE_AGY_EVENTS_FILES = broken + ',' + broken
+    process.env.FAKE_AGY_EVENTS_SEQ_FILE = join(dir, 'fake-seq')
+    process.env.FAKE_AGY_EXIT_CODE = '0'
+    process.env.FAKE_AGY_ARGS_FILE = join(dir, 'args.jsonl')
+    const cfg: GatewayConfig = { ...defaultConfig(), permissionMode: 'plan', timeoutMs: 5_000 }
+    const engine = new AgyEngine({
+      getConfig: () => cfg,
+      catalog: new ModelCatalog(async () => { throw new Error('no discovery in tests') }, cfg.fallbackModels, 300_000),
+      store: new SessionStore(join(dir, 'sessions.json')),
+      bin: () => fakeBin,
+      binArgs: [fakeScript],
+      acquire: () => Promise.resolve(() => {}),
+      runs: new RunRegistry(),
+      retryDelay: async () => {},
+    })
+    const chunks = await collect(
+      engine.stream(
+        call([msg('user', 'hi')], {
+          tools: [{ type: 'function', function: { name: 'get_weather', parameters: { type: 'object' } } }],
+        }),
+      ),
+    )
+    const finish = finishOf(chunks)
+    expect(finish.reason.kind).toBe('error')
+    expect(finish.reason.failure?.code).toBe(Err.INVALID_OUTPUT)
+    // 1 initial spawn + at most TOOL_BRIDGE_MAX_RETRIES respawns.
+    const spawnCount = readFileSync(process.env.FAKE_AGY_ARGS_FILE as string, 'utf8').split('\n').filter((l) => l.trim() !== '').length
+    expect(spawnCount).toBe(1 + TOOL_BRIDGE_MAX_RETRIES)
+    // No intermediate attempt text ever reached the client (buffered recut).
+    expect(textOf(chunks)).not.toContain('not a json envelope')
+    delete process.env.FAKE_AGY_EVENTS_FILES
+    delete process.env.FAKE_AGY_ARGS_FILE
+  })
+})
+
 describe('busy-aware spread (engine-level tracking, M5 drill fix)', () => {
   it('concurrent same-family arrivals select DIFFERENT accounts — the busy set is shared across stream() calls, not per call', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'agy-spread-'))
