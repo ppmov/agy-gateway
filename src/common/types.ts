@@ -48,6 +48,15 @@ export interface GatewayConfig {
   workspaceRoot: string
   fallbackModels: readonly FallbackModelDef[]
   rateLimitPerMinute: number
+  /**
+   * t_913f68e8 (A): request header carrying a stable per-conversation id
+   * (Hermes `providers.<name>.session_affinity_header`). When set, the value
+   * rides into `EngineCall.conversationKey`, which pins the agy conversation
+   * binding + account for the whole conversation — so account rotation no
+   * longer resets the binding to an 8k digest and silently truncates the turn
+   * context. Empty = off (byte-for-byte old behavior).
+   */
+  sessionAffinityHeader: string
   autoFallbackModel: boolean
   logRetentionDays: number
   /** Background quota polling interval in ms (default 15 min; clamped >= 60s).
@@ -143,6 +152,7 @@ export function defaultConfig(): GatewayConfig {
     workspaceRoot: '',
     fallbackModels: DEFAULT_FALLBACK_MODELS,
     rateLimitPerMinute: 0,
+    sessionAffinityHeader: '',
     autoFallbackModel: false,
     logRetentionDays: 7,
     quotaPollIntervalMs: 15 * 60_000,

@@ -182,6 +182,7 @@ function buildBase(overrides: OverridesFile): GatewayConfig {
         )
       : base.fallbackModels,
     rateLimitPerMinute: asNum(get('rateLimitPerMinute')) ?? base.rateLimitPerMinute,
+    sessionAffinityHeader: asString(get('sessionAffinityHeader')) ?? base.sessionAffinityHeader,
     autoFallbackModel: asBool(get('autoFallbackModel')) ?? base.autoFallbackModel,
     logRetentionDays: asNum(get('logRetentionDays')) ?? base.logRetentionDays,
     usageRetentionDays: asNum(get('usageRetentionDays')) ?? base.usageRetentionDays,
@@ -247,6 +248,7 @@ function applyEnv(cfg: GatewayConfig, env: NodeJS.ProcessEnv): GatewayConfig {
     const r = asNum(env.AGY_PROXY_RATE_LIMIT_PER_MINUTE)
     if (r !== undefined && r >= 0) cfg.rateLimitPerMinute = r
   }
+  if (env.AGY_PROXY_SESSION_AFFINITY_HEADER) cfg.sessionAffinityHeader = env.AGY_PROXY_SESSION_AFFINITY_HEADER
   if (env.AGY_PROXY_AUTO_FALLBACK_MODEL !== undefined) {
     const af = asBool(env.AGY_PROXY_AUTO_FALLBACK_MODEL)
     if (af !== undefined) cfg.autoFallbackModel = af

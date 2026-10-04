@@ -168,6 +168,14 @@ export interface EngineCall {
   signal?: AbortSignal
   /** Gateway session key for binding + steer/debounce scoping. */
   sessionKey?: string
+  /**
+   * t_913f68e8 (A): stable per-conversation id (Hermes
+   * `providers.<name>.session_affinity_header`) used ONLY for the agy
+   * conversation binding + sticky account pinning. Never feeds steer/debounce
+   * (that would preempt a sibling run sharing the conversation root). Empty =
+   * fall back to sessionKey (byte-for-byte old behavior).
+   */
+  conversationKey?: string
   /** JSON schema enforcing the final result (--json-schema). */
   jsonSchema?: unknown
   /**
@@ -541,6 +549,15 @@ export class AgyEngine {
   private readonly activeRuns = new Map<string, RunRecording>()
   /** sessionKey -> prompt info for duplicate submission debounce */
   private readonly activeSessionPrompts = new Map<string, { prompt: string; startedAt: number }>()
+  /**
+   * t_913f68e8 (C): conversationKey -> pinned account id. Keeps one
+   * conversation on one account for its whole life so the agy conversation
+   * binding survives (account rotation inside a turn was resetting it to an
+   * 8k digest and silently truncating context). Cleared organically when the
+   * pinned account stops being a viable candidate — then normal sticky
+   * selection takes over.
+   */
+  private readonly conversationAccount = new Map<string, string>()
   /** accountId -> timestamp of last spawn for spacing throttling */
   private readonly lastAccountSpawnTime = new Map<string, number>()
   private readonly minSpawnIntervalMs = 500
@@ -620,10 +637,10 @@ export class AgyEngine {
    * with the engine's short-cooldown store (a <5m window must read as "in
    * cooldown" even though the pool itself never recorded one).
    */
-  private selectAccountFor(family: ModelFamily, busy?: ReadonlySet<string>): ManagedAccount | null | undefined {
+  private selectAccountFor(family: ModelFamily, busy?: ReadonlySet<string>, preferred?: string): ManagedAccount | null | undefined {
     const pool = this.deps.pool
     if (!pool) return undefined
-    const acc = pool.selectAccount(family, busy)
+    const acc = pool.selectAccount(family, busy, preferred)
     if (acc === null || !this.shortCooldowns.isInCooldown(acc.id, family, Date.now())) return acc
     // The picked account sits in a short-cooldown window: exclude it (as
     // busy) and re-select so the request switches auth within the same call.
@@ -717,6 +734,11 @@ export class AgyEngine {
     const bin = this.deps.bin()
     if (!bin) throw new EngineError('agy binary not found on PATH — install it via https://antigravity.google/docs/cli/install', Err.AGY_NOT_INSTALLED)
     const sessionKey = call.sessionKey !== undefined ? String(call.sessionKey) : ''
+    // t_913f68e8 (A): a stable per-conversation id from Hermes' opt-in
+    // `session_affinity_header` rides EngineCall.conversationKey. It keys the
+    // agy conversation binding so rotation of the pool account no longer
+    // resets the binding to an 8k digest (the observed in= 152k→18k collapse).
+    const convKey = call.conversationKey !== undefined && call.conversationKey !== '' ? String(call.conversationKey) : ''
     // Tenant scoping (S-H2): the gateway never sets sessionKey, so without a
     // tenant dimension the conversation binding below degrades to
     // `:<accountId>` — shared by EVERY caller of that account, letting one
@@ -845,7 +867,7 @@ export class AgyEngine {
     // skipped by selectAccount so concurrent requests spread across the pool
     // (M5: acceptance §4 互不阻塞 / ≥2.5× throughput). Busy-but-healthy pools
     // fall through to the unfiltered selection inside the pool.
-    let account = this.selectAccountFor(family, this.busyAccounts)
+    let account = this.selectAccountFor(family, this.busyAccounts, convKey !== '' ? this.conversationAccount.get(convKey) : undefined)
     if (this.deps.pool && this.deps.pool.getAccounts().length > 0 && !account) {
       if (cfg.autoFallbackModel) {
         const fallbackSlugs = ['gemini-3.5-flash', 'gemini-3.6-flash']
@@ -892,9 +914,15 @@ export class AgyEngine {
       }
     }
 
-    const sessionAccountKey = account
-      ? `${tenantKey}:${sessionKey}:${account.id}`
-      : (sessionKey !== '' ? `${tenantKey}:${sessionKey}` : '')
+    // t_913f68e8 (A): with a stable conversation key the binding is keyed on
+    // the conversation ALONE (no account dimension), so it survives a forced
+    // account switch. Without it the old `tenant:session:account` shape is
+    // kept byte-for-byte (empty sessionKey → `root::<accountId>`).
+    const sessionAccountKey = convKey !== ''
+      ? `${tenantKey}:${convKey}`
+      : (account
+        ? `${tenantKey}:${sessionKey}:${account.id}`
+        : (sessionKey !== '' ? `${tenantKey}:${sessionKey}` : ''))
     let binding = sessionAccountKey !== '' ? this.deps.store.get(sessionAccountKey) : undefined
 
     // Model switch detection: If model changed in the session, drop stale agy conversation binding
@@ -1554,6 +1582,9 @@ export class AgyEngine {
         if (!rec.keepForContinuation) this.deps.runs.forget(rec.runId)
         if (last.failure === null) {
           if (last.account) this.deps.pool?.recordSuccess(last.account.id, family)
+          // t_913f68e8 (C): pin the successful account to the conversation so
+          // the next turn re-selects it instead of rotating mid-conversation.
+          if (convKey !== '' && last.account) this.conversationAccount.set(convKey, last.account.id)
           if (sessionAccountKey !== '') {
             const finalId = binding !== undefined ? binding.conversationId : last.conversationId
             if (finalId) {

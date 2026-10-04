@@ -565,8 +565,14 @@ export class AccountPoolManager {
    * across the pool instead of stacking on one account's concurrency:1 queue.
    * When every healthy account is busy, the busy filter is dropped (a
    * fully-busy pool still routes; the per-account queue re-serializes).
+   *
+   * t_913f68e8 (C, additive): `preferred` — the account a stable conversation
+   * was pinned to. Honored when it is still a viable candidate (enabled, not
+   * auth-required, not in cooldown, has quota, not busy); otherwise ignored so
+   * normal sticky selection takes over. Never changes the default path when
+   * omitted.
    */
-  selectAccount(family: ModelFamily, busy?: ReadonlySet<string>): ManagedAccount | null {
+  selectAccount(family: ModelFamily, busy?: ReadonlySet<string>, preferred?: string): ManagedAccount | null {
     const now = Date.now()
     const candidates = this.data.accounts.filter((acc) => {
       if (busy !== undefined && busy.has(acc.id)) return false
@@ -594,8 +600,15 @@ export class AccountPoolManager {
     if (candidates.length === 0) {
       // Everything healthy is busy — fall back to the unfiltered selection so
       // the request still routes (per-account queues re-serialize from here).
-      if (busy !== undefined && busy.size > 0) return this.selectAccount(family)
+      if (busy !== undefined && busy.size > 0) return this.selectAccount(family, undefined, preferred)
       return null
+    }
+
+    // t_913f68e8 (C): honor a pinned conversation account when it is still a
+    // viable candidate — do NOT advance the cursor (the pin is the schedule).
+    if (preferred !== undefined && preferred !== '') {
+      const pinned = candidates.find((a) => a.id === preferred)
+      if (pinned) return pinned
     }
 
     if (this.data.mode === 'round-robin' && candidates.length > 1) {

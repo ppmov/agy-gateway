@@ -99,12 +99,19 @@ function withCallMeta(
   request: Pick<import('fastify').FastifyRequest, 'headers' | 'id'>,
   call: EngineCall,
   protocol: 'openai' | 'anthropic',
+  cfg: GatewayConfig,
   readImage?: EngineCall['readImage'],
 ): EngineCall {
   const hdr = request.headers['x-request-id']
+  // t_913f68e8 (A): lift Hermes' opt-in conversation-affinity header (if the
+  // route declares one) into EngineCall.conversationKey so the engine can pin
+  // the agy conversation binding + account for the whole conversation.
+  const affinityHeader = cfg.sessionAffinityHeader
+  const affinityId = affinityHeader !== '' ? request.headers[affinityHeader.toLowerCase()] : undefined
   return {
     ...call,
     ...(readImage !== undefined ? { readImage } : {}),
+    ...(typeof affinityId === 'string' && affinityId.trim() !== '' ? { conversationKey: affinityId.trim() } : {}),
     meta: {
       reqId: request.id,
       ...(typeof hdr === 'string' && hdr.trim() !== '' ? { clientReqId: hdr.trim() } : {}),
@@ -294,11 +301,11 @@ export function buildServer(deps: ServerDeps): BuiltServer {
 
     try {
       if (meta.stream === true) {
-        await streamOpenAiChat({ deps, request, reply, call: withCallMeta(request, call, 'openai', readImage), meta, abort, inFlight })
+        await streamOpenAiChat({ deps, request, reply, call: withCallMeta(request, call, 'openai', cfg, readImage), meta, abort, inFlight })
         return
       }
       const chunks: StreamChunk[] = []
-      for await (const ch of deps.engine.stream(withCallMeta(request, call, 'openai', readImage))) {
+      for await (const ch of deps.engine.stream(withCallMeta(request, call, 'openai', cfg, readImage))) {
         chunks.push(ch)
       }
       const collected = collectChunks(chunks)
@@ -376,11 +383,11 @@ export function buildServer(deps: ServerDeps): BuiltServer {
 
     try {
       if (meta.stream === true) {
-        await streamAnthropicMessages({ deps, request, reply, call: withCallMeta(request, call, 'anthropic', readImage), meta, abort, inFlight })
+        await streamAnthropicMessages({ deps, request, reply, call: withCallMeta(request, call, 'anthropic', cfg, readImage), meta, abort, inFlight })
         return
       }
       const chunks: StreamChunk[] = []
-      for await (const ch of deps.engine.stream(withCallMeta(request, call, 'anthropic', readImage))) {
+      for await (const ch of deps.engine.stream(withCallMeta(request, call, 'anthropic', cfg, readImage))) {
         chunks.push(ch)
       }
       const collected = collectAnthropicChunks(chunks)
