@@ -1250,6 +1250,13 @@ export class AgyEngine {
     // survive beyond the current process (a kill between retry attempts must
     // not be followed by a fresh spawn), so it flips a flag as well.
     let proc: ReturnType<typeof startAgyProcess> | undefined
+    // t_1e2de674 fast-fail: set when a HARD quota signature lands on stderr
+    // DURING the run (live detector below). The spawn is killed immediately
+    // and the classification is forced onto the quota branch so the settle-time
+    // cooldown still fires — a bare kill would settle as ABORTED (outcome.aborted
+    // is checked FIRST at classification) and leave the exhausted account in
+    // rotation, which is the whole point of the fix. attempt-scoped: reset per
+    // runOnce via the closure of the local below.
     let steerAborted = false
     rec.requestAbort = () => {
       steerAborted = true
@@ -1317,6 +1324,11 @@ export class AgyEngine {
         }
         const parser = new StreamJsonParser()
         this.deps.onParser?.(parser)
+        // t_1e2de674 (attempt-scoped): a hard quota signature seen live on
+        // stderr aborts this spawn at once. Reset per attempt so a retry on
+        // another account starts clean.
+        let quotaReachedLive = false
+        let quotaErrText = ''
         const before = snapshotConversations(attemptAcc?.dir || undefined)
         let streamCid: string | null = null
         // Phase 3 tool-bridge: the retry spawn must use the SAME account env
@@ -1348,6 +1360,19 @@ export class AgyEngine {
                 if (ev.kind === 'init' && ev.conversationId) streamCid = ev.conversationId
                 if (ev.kind === 'result' && ev.conversationId !== '') streamCid = ev.conversationId
                 rec.append(ev)
+              }
+            },
+            // t_1e2de674: live quota fast-fail. The narrow HARD-only detector
+            // (RESOURCE_EXHAUSTED / quota reached / 429) never trips on soft
+            // capacity text ("model overloaded"/"high traffic"), so a healthy
+            // account is never killed on a signal that must not cool it down.
+            // The kill carries 'abort' but the run is reclassified onto the
+            // quota branch below, so the settle-time cooldown still fires.
+            onStderr: (line) => {
+              if (!quotaReachedLive && looksLikeHardRateLimit(line)) {
+                quotaReachedLive = true
+                quotaErrText = line
+                proc?.kill('abort')
               }
             },
           })
@@ -1393,10 +1418,22 @@ export class AgyEngine {
         // text merely MENTIONED "rate limit"/"quota" (or contained a hash with
         // "429") used to be misclassified as a quota failure, masking the real
         // error and slapping a ghost cooldown on a healthy account.
-        const rawErrText = [outcome.stderrTail, parser.stats.lastResultError].filter(Boolean).join(' ')
+        const rawErrText = [quotaErrText, outcome.stderrTail, parser.stats.lastResultError].filter(Boolean).join(' ')
         const isRateLimit = looksLikeRateLimit(rawErrText)
         let failure: { kind: 'error' | 'aborted'; code: string; message: string } | null = null
-        if (outcome.aborted) {
+        if (quotaReachedLive && isRateLimit && !consumable) {
+          // t_1e2de674: the live stderr detector already killed this spawn on a
+          // HARD quota signature. Classify it on the quota branch (AGY_ERROR +
+          // classifier kind) BEFORE the abort branch: the kill set
+          // outcome.aborted, and `aborted` is otherwise checked first, so the
+          // run would settle ABORTED — no cooldown — and the exhausted account
+          // would stay in rotation. isRateLimit holds (looksLikeHardRateLimit ⊆
+          // looksLikeRateLimit); `!consumable` keeps a run that still delivered
+          // an answer from being failed.
+          const bestMsg = quotaErrText || parser.stats.lastResultError || (outcome.stderrTail ? brief(outcome.stderrTail) : 'Rate limit or quota reached')
+          const d429 = gatewayPatch.classifyAgy429(bestMsg)
+          failure = { kind: 'error', code: Err.AGY_ERROR, message: 'Google Antigravity quota / rate limit reached (' + d429.kind + '): ' + bestMsg }
+        } else if (outcome.aborted) {
           failure = abortFailure()
         } else if (outcome.timedOut) {
           failure = { kind: 'error', code: Err.TIMEOUT, message: 'agy run was idle for ' + cfg.timeoutMs + 'ms without output' }

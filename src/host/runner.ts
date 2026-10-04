@@ -236,6 +236,17 @@ export interface RunOptions {
    * discovery and the --version probe parse the complete stream.
    */
   onChunk?: (chunk: string) => void
+  /**
+   * Live stderr line consumer (t_1e2de674). agy can spend ~2.5min retrying an
+   * exhausted quota before it exits, so the engine must see the server-issued
+   * quota line the moment it lands instead of reading it out of `stderrTail`
+   * after the process is gone. Lines are split exactly like the tail capture;
+   * the tail accumulation and the watchdog refresh stay unchanged. A throwing
+   * consumer is parked in the tail (safeOnStderr), never fatal. The seam is
+   * shared with the retry-policy work (t_67b7936c) — reuse it, do not add a
+   * second stderr hook.
+   */
+  onStderr?: (line: string) => void
   /** stdin stays writable (auth code injection). */
   keepStdin?: boolean
   /**
@@ -327,6 +338,10 @@ export function startAgyProcess(opts: RunOptions): RunningProcess {
   child.stdin?.on('error', () => {})
   let stdout = ''
   let stderr = ''
+  // t_1e2de674: line buffer for the live stderr consumer (onStderr). Separate
+  // from the tail string so a consumer never sees the accumulated tail — only
+  // complete lines, in arrival order.
+  let stderrPending = ''
   let timedOut = false
   let aborted = false
   let settled = false
@@ -424,6 +439,13 @@ export function startAgyProcess(opts: RunOptions): RunningProcess {
       stderr = (stderr + '[onChunk] ' + String(err)).slice(-4096)
     }
   }
+  const safeOnStderr = (line: string): void => {
+    try {
+      opts.onStderr?.(line)
+    } catch (err) {
+      stderr = (stderr + '[onStderr] ' + String(err)).slice(-4096)
+    }
+  }
   // A-M5: with a chunk consumer the run's stdout copy is bounded to the head
   // 4KB + tail 64KB the engine actually reads; without one, models discovery
   // and --version need the whole stream, so capture stays unbounded (with the
@@ -465,6 +487,18 @@ export function startAgyProcess(opts: RunOptions): RunningProcess {
     // window, trim there; resolve slices the exact 4096-char suffix.
     stderr += chunk
     if (stderr.length > 8192) stderr = stderr.slice(-8192)
+    // t_1e2de674: hand each complete stderr LINE to the live consumer (quota
+    // fast-fail). Line splitting mirrors the stdout onLine path; a partial
+    // trailing line stays buffered until the next chunk or finish().
+    if (opts.onStderr !== undefined) {
+      stderrPending += chunk
+      let nl: number
+      while ((nl = stderrPending.indexOf('\n')) >= 0) {
+        const line = stderrPending.slice(0, nl).replace(/\r$/, '')
+        stderrPending = stderrPending.slice(nl + 1)
+        safeOnStderr(line)
+      }
+    }
   })
 
   const outcome = new Promise<RunOutcome>((resolve) => {
@@ -477,6 +511,12 @@ export function startAgyProcess(opts: RunOptions): RunningProcess {
       if (pending !== '') {
         safeOnLine(pending)
         pending = ''
+      }
+      // t_1e2de674: flush a trailing partial stderr line (no newline before
+      // exit) to the live consumer so a final quota line is never lost.
+      if (stderrPending !== '') {
+        safeOnStderr(stderrPending.replace(/\r$/, ''))
+        stderrPending = ''
       }
       resolve({
         code,
