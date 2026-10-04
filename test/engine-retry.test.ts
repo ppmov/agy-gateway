@@ -411,6 +411,54 @@ describe('engine-level single retry', () => {
     expect(finish.reason.failure?.code).toBe(Err.TIMEOUT)
     expect(finish.reason.kind).toBe('error')
   })
+
+  it('a DENY-empty turn (denied_actions on the envelope) is classified DENIED_ACTIONS and NOT retried', async () => {
+    // t_71dd6987: an auto-denied native tool ends ok + empty, like the #902
+    // shape — but a respawn re-runs the same prompt under the same headless
+    // policy and cannot change the denial. The envelope's non-empty
+    // `denied_actions` is the distinguishing marker: classify DENIED_ACTIONS
+    // (not in RETRYABLE_CODES) and serve the real cause on the FIRST spawn.
+    const h = mk()
+    h.setMode('deny-empty')
+    const chunks = await collect(h.engine.stream(call([msg('user', 'hi')])))
+    expect(h.spawns()).toBe(1)
+    expect(h.delays).toEqual([])
+    const finish = finishOf(chunks)
+    expect(finish.reason.kind).toBe('error')
+    expect(finish.reason.failure?.code).toBe(Err.DENIED_ACTIONS)
+    expect(finish.reason.failure?.message).toContain('denied_actions')
+    expect(textOf(chunks)).toBe('')
+    await vi.waitFor(() => {
+      expect(h.onRunCalls).toHaveLength(1)
+      expect(h.onRunCalls[0]).toMatchObject({ attempt: 0, final: true, ok: false, code: Err.DENIED_ACTIONS })
+    }, { timeout: 5_000, interval: 10 })
+  })
+
+  it('an empty denied_actions ([]) is NOT the deny shape — it stays the retryable #902 empty', async () => {
+    // Guard against a false positive: agy may serialize an empty deny list on
+    // ordinary turns. Only a NON-empty denied_actions may divert from the
+    // #902 retry path; an empty array must keep the CANCELED-empty behaviour.
+    const h = mk()
+    const denied = join(h.dir, 'denied-empty-list.ndjson')
+    appendFileSync(denied, JSON.stringify({ event: 'init', conversation_id: 'c-x', model: 'gemini' }) + '\n')
+    appendFileSync(denied, JSON.stringify({ event: 'result', result: { conversation_id: 'c-x', status: 'SUCCESS', response: '', denied_actions: [], usage: { input_tokens: 3, output_tokens: 0 } } }) + '\n')
+    const recovered = join(h.dir, 'recovered.ndjson')
+    appendFileSync(recovered, JSON.stringify({ event: 'init', conversation_id: 'c-y', model: 'gemini' }) + '\n')
+    appendFileSync(recovered, JSON.stringify({ event: 'result', result: { conversation_id: 'c-y', status: 'SUCCESS', response: 'recovered answer', usage: { input_tokens: 3, output_tokens: 4 } } }) + '\n')
+    process.env.FAKE_AGY_EVENTS_FILES = denied + ',' + recovered
+    process.env.FAKE_AGY_EVENTS_SEQ_FILE = join(h.dir, 'fake-seq')
+    process.env.FAKE_AGY_EXIT_CODE = '0'
+    const chunks = await collect(h.engine.stream(call([msg('user', 'hi')])))
+    expect(h.spawns()).toBe(2)
+    const finish = finishOf(chunks)
+    expect(finish.reason.kind).toBe('stop')
+    expect(textOf(chunks)).toContain('recovered answer')
+    await vi.waitFor(() => {
+      expect(h.onRunCalls).toHaveLength(2)
+      expect(h.onRunCalls[0]).toMatchObject({ attempt: 0, final: false, ok: false, code: Err.INVALID_OUTPUT })
+      expect(h.onRunCalls[1]).toMatchObject({ attempt: 1, final: true, ok: true, code: 'OK' })
+    }, { timeout: 5_000, interval: 10 })
+  })
 })
 
 describe('computeRetryDelayMs (pure backoff math)', () => {

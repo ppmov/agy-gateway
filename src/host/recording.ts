@@ -145,10 +145,11 @@ export class RunRecording {
   }
 
   /** The last result envelope's finish-relevant projection, when one arrived.
-   *  `structuredOutput` rides along verbatim (untyped) because the emptiness
-   *  of the CANCELED shape is decided on its CONTENT (absent / '' / {} are all
-   *  "no answer"), not on the presence of the key. */
-  getResultEvent(): { ok: boolean; response: string; structuredOutput?: unknown } | null {
+   *  `structuredOutput` and `deniedActions` ride along verbatim (untyped)
+   *  because the emptiness of the CANCELED shape is decided on CONTENT (absent
+   *  / '' / {} are all "no answer"), and a deny-empty turn is told apart from
+   *  it by a non-empty `denied_actions`. */
+  getResultEvent(): { ok: boolean; response: string; structuredOutput?: unknown; deniedActions?: unknown } | null {
     for (let i = this.events.length - 1; i >= 0; i--) {
       const ev = this.events[i]
       if (ev !== undefined && ev.kind === 'result') {
@@ -156,6 +157,7 @@ export class RunRecording {
           ok: ev.ok,
           response: ev.response,
           ...(ev.structuredOutput !== undefined ? { structuredOutput: ev.structuredOutput } : {}),
+          ...(ev.deniedActions !== undefined ? { deniedActions: ev.deniedActions } : {}),
         }
       }
     }

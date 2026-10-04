@@ -203,6 +203,13 @@ export const Err = {
   ELIGIBILITY_BLOCKED: 'ELIGIBILITY_BLOCKED',
   /** Per-key model whitelist violation (M5) → 403, both protocol tables. */
   MODEL_NOT_ALLOWED: 'MODEL_NOT_ALLOWED',
+  /** A headless turn whose only outcome was an auto-denied native tool (agy
+   *  auto-denies a tool it cannot prompt for and ends with an empty response,
+   *  listing the refusals in `result.denied_actions`). Distinct from
+   *  INVALID_OUTPUT so it is NOT in RETRYABLE_CODES: a respawn re-runs the same
+   *  prompt against the same headless policy and cannot change the denial, so
+   *  retrying only burns a spawn and doubles the client's wait. → 502. */
+  DENIED_ACTIONS: 'DENIED_ACTIONS',
   /** The server gave up on a parked/queued request: client disconnect while
    *  waiting for a concurrency slot (B3/P4 semaphore) or a shutdown-drain
    *  abort. → 503 api_error on both protocol tables. */
@@ -276,8 +283,30 @@ export interface ResultEvent {
    * shape-agnostic — the bridge layer validates it (see parseToolBridgeAnswer).
    */
   structuredOutput?: unknown
+  /**
+   * Raw `result.denied_actions` from the agy envelope. When the model tries a
+   * native tool the headless session cannot prompt for, agy auto-denies it and
+   * finishes with an EMPTY response / SUCCESS status, listing the refusals here
+   * (observed live: `[{action:'command',display_name:'RunCommand'}]`). That
+   * makes a deny-empty turn distinguishable from the #902 CANCELED-empty and
+   * from a plain empty — a respawn cannot change a denial, so the engine must
+   * not burn a retry on it. Kept untyped-unknown (parser is shape-agnostic).
+   */
+  deniedActions?: unknown
   error?: string
   usage: RawUsage
+}
+
+/**
+ * Whether a result envelope reports auto-denied native tools. Only a NON-EMPTY
+ * `denied_actions` counts: agy emits `[]` on turns with no denials, and that
+ * must not be mistaken for the deny shape.
+ */
+export function hasDeniedActions(value: unknown): boolean {
+  if (value === undefined || value === null) return false
+  if (Array.isArray(value)) return value.length > 0
+  if (typeof value === 'object') return Object.keys(value as Record<string, unknown>).length > 0
+  return false
 }
 
 export interface GarbageEvent {

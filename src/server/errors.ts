@@ -68,6 +68,7 @@ export function errorStatus(code: string): { statusCode: number; type: string } 
     case 'TIMEOUT':
     case 'PROCESS_EXIT':
     case 'INVALID_OUTPUT':
+    case 'DENIED_ACTIONS':
     case 'AGY_ERROR':
     case 'AGY_VERSION_UNSUPPORTED':
       return { statusCode: 502, type: 'api_error' }
@@ -152,6 +153,7 @@ export function anthropicStatusFor(code: string, message: string): { statusCode:
     case 'TIMEOUT':
     case 'PROCESS_EXIT':
     case 'INVALID_OUTPUT':
+    case 'DENIED_ACTIONS':
     case 'AGY_ERROR':
     case 'AGY_VERSION_UNSUPPORTED':
       return { statusCode: 502, type: 'api_error' }

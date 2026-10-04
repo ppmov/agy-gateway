@@ -183,6 +183,7 @@ export function classifyEvent(obj: unknown, seq: number): AgyEvent | undefined {
     // intact for the tool-bridge layer.
     const structured = inner.structured_output ?? inner.structuredOutput
     const response = pick(inner, ['response', 'text', 'content'])
+    const deniedActions = inner.denied_actions ?? inner.deniedActions
     const error = pick(inner, ['error', 'error_message', 'errorMessage'])
     const ok = status === undefined ? !error : String(status).toUpperCase() !== 'ERROR'
     return {
@@ -191,6 +192,7 @@ export function classifyEvent(obj: unknown, seq: number): AgyEvent | undefined {
       ok,
       response: typeof response === 'string' ? response : '',
       ...(structured !== undefined && structured !== null ? { structuredOutput: structured } : {}),
+      ...(deniedActions !== undefined && deniedActions !== null ? { deniedActions } : {}),
       ...(typeof error === 'string' ? { error } : {}),
       usage: parseUsage(inner.usage),
     }

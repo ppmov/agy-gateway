@@ -250,6 +250,20 @@ if (mode === 'canceled-empty') {
   process.exit(0)
 }
 
+// DENY-empty drill (t_71dd6987): a headless turn that burned itself on an
+// auto-denied native tool. Live shape (star-cliproxy raw_stdout, request
+// IdVDPXH8BIVFOUBiSWzoj): status=SUCCESS, response:"", a non-empty
+// denied_actions:[{action:'command',display_name:'RunCommand'}], plus the
+// "jetski: no output produced — a tool required the \"command\" permission …"
+// stderr line. The engine must classify DENIED_ACTIONS and NOT retry (a
+// respawn cannot change a denial).
+if (mode === 'deny-empty') {
+  emit({ event: 'init', conversation_id: conv, model: 'gemini-3-6-flash' })
+  process.stderr.write('jetski: no output produced — a tool required the "command" permission that headless mode cannot prompt for, so it was auto-denied.\n')
+  emit({ event: 'result', result: { conversation_id: conv, status: 'SUCCESS', response: '', duration_seconds: 4, num_turns: 1, usage: { input_tokens: 100, output_tokens: 20 }, denied_actions: [{ action: 'command', display_name: 'RunCommand' }] } })
+  process.exit(0)
+}
+
 if (mode === 'exit12') {
   process.stderr.write('boom: fake crash\n')
   process.exit(12)

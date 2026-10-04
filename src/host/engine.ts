@@ -21,7 +21,7 @@ import { randomUUID } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import PQueue from 'p-queue'
-import { Err, extractValidationUrl, hasStructuredContent, looksLikeAuthFailure, looksLikeEligibilityBlocked, looksLikeHardRateLimit, looksLikeRateLimit, looksLikeValidationRequired, type GatewayConfig } from '../common/types.ts'
+import { Err, extractValidationUrl, hasDeniedActions, hasStructuredContent, looksLikeAuthFailure, looksLikeEligibilityBlocked, looksLikeHardRateLimit, looksLikeRateLimit, looksLikeValidationRequired, type GatewayConfig } from '../common/types.ts'
 import { modelFamilyOf, type ManagedAccount, type ModelFamily } from '../common/pool-types.ts'
 import type { AccountPoolManager } from './pool.ts'
 import { diffConversations, snapshotConversations } from './discovery.ts'
@@ -1279,7 +1279,7 @@ export class AgyEngine {
       outcome: RunOutcome
       rawErrText: string
       conversationId: string | null
-      resultEvent: { ok: boolean; response: string } | null
+      resultEvent: { ok: boolean; response: string; structuredOutput?: unknown; deniedActions?: unknown } | null
       account: typeof account
     }
 
@@ -1377,8 +1377,17 @@ export class AgyEngine {
         // tool turns): agy ends with status=CANCELED / empty response yet exits
         // 0, and the parser classifies it ok. The client would see an empty
         // success; intercept it as a retryable INVALID_OUTPUT failure instead.
-        const canceledEmpty = r !== null && r.ok && r.response === '' && !hasStructuredContent(r.structuredOutput) && !rec.sawTextBefore(rec.length)
-        const consumable = r !== null && (r.ok || r.response !== '') && !canceledEmpty
+        //
+        // DENY-empty guard (t_71dd6987): a headless turn that burned itself on
+        // an auto-denied native tool ALSO ends ok + empty, but a respawn can
+        // never change the denial. It is told apart by a NON-EMPTY
+        // `denied_actions` on the envelope and classified DENIED_ACTIONS (not
+        // in RETRYABLE_CODES), so the client gets the real cause at once
+        // instead of a wasted spawn.
+        const emptyShape = r !== null && r.ok && r.response === '' && !hasStructuredContent(r.structuredOutput) && !rec.sawTextBefore(rec.length)
+        const deniedEmpty = emptyShape && hasDeniedActions(r.deniedActions)
+        const canceledEmpty = emptyShape && !deniedEmpty
+        const consumable = r !== null && (r.ok || r.response !== '') && !canceledEmpty && !deniedEmpty
         // Error classification scans ONLY stderr and the result envelope's
         // error field. stdout is model prose + event JSON: a run whose streamed
         // text merely MENTIONED "rate limit"/"quota" (or contained a hash with
@@ -1440,6 +1449,8 @@ export class AgyEngine {
             } else {
               failure = { kind: 'error', code: Err.PROCESS_EXIT, message: 'agy exited with code ' + outcome.code + suffix }
             }
+          } else if (deniedEmpty) {
+            failure = { kind: 'error', code: Err.DENIED_ACTIONS, message: 'agy auto-denied a native tool in headless mode and produced no answer (denied_actions)' }
           } else if (canceledEmpty) {
             failure = { kind: 'error', code: Err.INVALID_OUTPUT, message: 'agy ended with an empty response (CANCELED, google antigravity #902)' }
           } else if (parser.stats.lastResultError) {
