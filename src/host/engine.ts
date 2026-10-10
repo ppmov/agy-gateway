@@ -21,7 +21,7 @@ import { randomUUID } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import PQueue from 'p-queue'
-import { Err, extractValidationUrl, hasDeniedActions, hasStructuredContent, looksLikeAuthFailure, looksLikeEligibilityBlocked, looksLikeHardRateLimit, looksLikeRateLimit, looksLikeValidationRequired, type GatewayConfig } from '../common/types.ts'
+import { Err, extractValidationUrl, hasDeniedActions, hasStructuredContent, looksLikeAuthFailure, looksLikeEligibilityBlocked, looksLikeHardRateLimit, looksLikeRateLimit, looksLikeTransientEligibilityTransport, looksLikeValidationRequired, type GatewayConfig } from '../common/types.ts'
 import { modelFamilyOf, type ManagedAccount, type ModelFamily } from '../common/pool-types.ts'
 import type { AccountPoolManager } from './pool.ts'
 import { diffConversations, snapshotConversations } from './discovery.ts'
@@ -66,7 +66,7 @@ export class EngineError extends Error {
 }
 
 /** Codes the service layer may retry once (ADR-11 discipline, engine-owned). */
-export const RETRYABLE_CODES: readonly string[] = [Err.TIMEOUT, Err.PROCESS_EXIT, Err.INVALID_OUTPUT]
+export const RETRYABLE_CODES: readonly string[] = [Err.TIMEOUT, Err.PROCESS_EXIT, Err.INVALID_OUTPUT, Err.UPSTREAM_UNAVAILABLE]
 
 /** Retry policy constants for the service layer (inherited from ADR-11). */
 export const RETRY_POLICY = {
@@ -1458,13 +1458,26 @@ export class AgyEngine {
           const detail = parser.stats.lastResultError ?? (outcome.stderrTail !== '' ? brief(outcome.stderrTail) : 'upstream requires re-validation (VALIDATION_REQUIRED)')
           const url = extractValidationUrl(detail)
           failure = { kind: 'error', code: Err.VALIDATION_REQUIRED, message: url !== undefined ? detail + ' (validation_url: ' + url + ')' : detail }
+        } else if (looksLikeTransientEligibilityTransport(rawErrText)) {
+          // t_a1cb54bc: a transport-only failure of the eligibility PROBE — the
+          // relay/upstream is unreachable while agy checks loadCodeAssist ("Bad
+          // Gateway" 502, EOF, 503 UNAVAILABLE). This is a ROUTE state shared by
+          // every account behind the relay, NOT an account fault: classify it
+          // UPSTREAM_UNAVAILABLE and leave account state untouched (the settle
+          // branch below only quarantines ELIGIBILITY_BLOCKED). It is retryable,
+          // so a relay blip switches to another account instead of exiling the
+          // whole pool. Must precede looksLikeEligibilityBlocked: the same text
+          // carries the `Eligibility check failed:` prefix but is not geo.
+          const detail = parser.stats.lastResultError ?? (outcome.stderrTail !== '' ? brief(outcome.stderrTail) : 'upstream eligibility probe transport failure')
+          failure = { kind: 'error', code: Err.UPSTREAM_UNAVAILABLE, message: detail }
         } else if (looksLikeEligibilityBlocked(rawErrText)) {
           // Google eligibility/geo gate: the account cannot obtain a session
-          // (loadCodeAssist 502/Not Allowed, "not eligible for Antigravity",
-          // "User location is not supported"). Classified distinctly from a
-          // generic PROCESS_EXIT — which is retryable and re-spawns the same
-          // dead account — so the settle-time quarantine takes it out of
-          // rotation instead.
+          // ("not eligible for Antigravity", "User location is not supported").
+          // Classified distinctly from a generic PROCESS_EXIT — which is
+          // retryable and re-spawns the same dead account — so the settle-time
+          // quarantine takes it out of rotation instead (now with a TTL, see
+          // pool.recordEligibilityFailure). A transport-only probe failure never
+          // reaches here (handled above).
           const detail = parser.stats.lastResultError ?? (outcome.stderrTail !== '' ? brief(outcome.stderrTail) : 'upstream eligibility/geo gate refused the account (ELIGIBILITY_BLOCKED)')
           failure = { kind: 'error', code: Err.ELIGIBILITY_BLOCKED, message: detail }
         } else if (isRateLimit) {

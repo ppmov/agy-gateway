@@ -77,8 +77,13 @@ export interface ManagedAccount {
    * eligibility refusals and the time of the last one. Drives the quarantine
    * threshold in AccountPoolManager.recordEligibilityFailure; cleared by
    * recordSuccess (and by clearAuthRequired, an explicit operator reset).
+   * `until` (t_a1cb54bc) = epoch ms at which the quarantine window expires:
+   * even a REAL geo refusal must not block the pool forever, so the account
+   * auto-recovers when the window lapses (see isEligibilityQuarantined). A
+   * legacy record without `until` is treated as an ACTIVE quarantine
+   * (`?? Infinity`) for backward compatibility; new records always carry it.
    */
-  eligibilityFailures?: { consecutive: number; lastAt: number }
+  eligibilityFailures?: { consecutive: number; lastAt: number; until?: number }
   /** Cooldown state tracked per model family. */
   cooldowns: Partial<Record<ModelFamily, FamilyCooldownState>>
   /** Cached real-time quota statistics per model family. */
@@ -94,15 +99,30 @@ export interface AccountHealthInfo {
 }
 
 /**
+ * Whether the account is CURRENTLY quarantined out of rotation (t_a1cb54bc).
+ * A bare `authRequired` (AUTH / VALIDATION_REQUIRED — no eligibility record)
+ * stays quarantined until an operator clear or a success. An eligibility
+ * quarantine expires with its window (`until`), so even a real geo refusal
+ * auto-recovers; a legacy record without `until` reads as an active
+ * quarantine (`?? Infinity`) for backward compatibility. Pure predicate — the
+ * lazy removal of an expired window lives in AccountPoolManager.
+ */
+export function isEligibilityQuarantined(account: ManagedAccount): boolean {
+  return account.authRequired === true && (account.eligibilityFailures?.until ?? Infinity) > Date.now()
+}
+
+/**
  * Whether the background quota poller should touch this account at all.
  * Disabled, auth-quarantined and cooldown accounts are skipped so automatic
  * polling never hammers Google endpoints for accounts already known to be
  * restricted (risk-control exposure minimization). Manual force refresh
- * from the UI bypasses this gate.
+ * from the UI bypasses this gate. An eligibility quarantine is skipped only
+ * while its window is live — after it lapses the account is polled again
+ * (otherwise it could never re-earn quota and would stay out forever).
  */
 export function shouldPollAccount(account: ManagedAccount): boolean {
   if (!account.enabled) return false
-  if (account.authRequired) return false
+  if (isEligibilityQuarantined(account)) return false
   const now = Date.now()
   for (const cd of Object.values(account.cooldowns)) {
     if (cd && cd.cooldownUntil > now) return false
@@ -113,7 +133,7 @@ export function shouldPollAccount(account: ManagedAccount): boolean {
 /** Compute real-time health indicator for an account. */
 export function getAccountHealth(account: ManagedAccount, family: ModelFamily = 'google'): AccountHealthInfo {
   if (!account.enabled) return { status: 'disabled', message: 'Account disabled' }
-  if (account.authRequired) return { status: 'auth_required', message: account.authError || 'Authentication required' }
+  if (isEligibilityQuarantined(account)) return { status: 'auth_required', message: account.authError || 'Authentication required' }
   const cd = account.cooldowns[family]
   if (cd && cd.cooldownUntil > Date.now()) {
     return {

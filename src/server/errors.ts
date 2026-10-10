@@ -65,6 +65,10 @@ export function errorStatus(code: string): { statusCode: number; type: string } 
     // known retry moment exists to advertise.
     case 'ABORTED':
       return { statusCode: 503, type: 'api_error' }
+    // UPSTREAM_UNAVAILABLE: the relay/upstream is unreachable on the
+    // eligibility probe — a route condition, not the account's fault; same
+    // 502 api_error as the other upstream transport classes (never 403).
+    case 'UPSTREAM_UNAVAILABLE':
     case 'TIMEOUT':
     case 'PROCESS_EXIT':
     case 'INVALID_OUTPUT':
@@ -150,6 +154,10 @@ export function anthropicStatusFor(code: string, message: string): { statusCode:
     // Same ABORTED row as errorStatus above — see the rationale there.
     case 'ABORTED':
       return { statusCode: 503, type: 'api_error' }
+    // UPSTREAM_UNAVAILABLE: the relay/upstream is unreachable on the
+    // eligibility probe — a route condition, not the account's fault; same
+    // 502 api_error as the other upstream transport classes (never 403).
+    case 'UPSTREAM_UNAVAILABLE':
     case 'TIMEOUT':
     case 'PROCESS_EXIT':
     case 'INVALID_OUTPUT':

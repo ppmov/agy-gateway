@@ -10,6 +10,10 @@
 //                   envelope with the same text, exit 1 (M3 429 drill)
 //   validation    — 403 VALIDATION_REQUIRED line + ERROR envelope carrying
 //                   the challenge URL, exit 1 (M3 validation drill)
+//   eligibility   — geo/identity refusal (not eligible for Antigravity /
+//                   location unsupported), exit 1 → ELIGIBILITY_BLOCKED
+//   eligibility-transport — transport-only loadCodeAssist probe failure
+//                   (Bad Gateway / unexpected EOF), exit 1 → UPSTREAM_UNAVAILABLE
 //   real          — real agy 1.1.15 stream-json shapes (nested step_update
 //                   envelopes, agent_response text_delta fragments,
 //                   thinking-only turns, tool ACTIVE/DONE/ERROR)
@@ -259,13 +263,28 @@ if (mode === 'validation') {
   process.exit(1)
 }
 
-// Eligibility/geo gate (t_a5691f67): the real shape from the 29.09 ledger
-// series — stderr carries the loadCodeAssist refusal and the result envelope
-// repeats it; agy exits 1. Must classify as ELIGIBILITY_BLOCKED (NOT plain
-// PROCESS_EXIT) so the account leaves rotation instead of being re-spawned.
+// Eligibility/geo gate (t_a5691f67): the REAL geo refusal — the account is not
+// eligible for Antigravity in its location. The credential is intact but the
+// upstream gate refuses a session; agy exits 1. Must classify as
+// ELIGIBILITY_BLOCKED (NOT plain PROCESS_EXIT) so the account leaves rotation
+// (now with a TTL, t_a1cb54bc). The transport-only shape is the
+// 'eligibility-transport' mode below.
 if (mode === 'eligibility') {
-  process.stderr.write('Error: Eligibility check failed: loadCodeAssist: Bad Gateway\n')
-  emit({ event: 'result', result: { conversation_id: conv, status: 'ERROR', response: '', error: 'Eligibility check failed: loadCodeAssist: Bad Gateway', duration_seconds: 31.4, num_turns: 0, usage: { input_tokens: 0, output_tokens: 0 } } })
+  process.stderr.write('Error: Eligibility check failed: Your current account is not eligible for Antigravity, because it is not currently available in your location.\n')
+  emit({ event: 'result', result: { conversation_id: conv, status: 'ERROR', response: '', error: 'Eligibility check failed: Your current account is not eligible for Antigravity, because it is not currently available in your location.', duration_seconds: 31.4, num_turns: 0, usage: { input_tokens: 0, output_tokens: 0 } } })
+  process.exit(1)
+}
+
+// Transport-only eligibility PROBE failure (t_a1cb54bc): the relay/upstream is
+// unreachable while agy checks loadCodeAssist (Bad Gateway 502 / unexpected
+// EOF) — the same `Eligibility check failed:` prefix as the geo mode, but a
+// ROUTE state, not an account fault. Must classify as UPSTREAM_UNAVAILABLE and
+// leave the account un-quarantined. FAKE_AGY_ELIG_TRANSPORT_TEXT overrides the
+// body so the same mode can emit the EOF variant.
+if (mode === 'eligibility-transport') {
+  const body = process.env.FAKE_AGY_ELIG_TRANSPORT_TEXT ?? 'Post "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist": Bad Gateway'
+  process.stderr.write('Error: Eligibility check failed: ' + body + '\n')
+  emit({ event: 'result', result: { conversation_id: conv, status: 'ERROR', response: '', error: 'Eligibility check failed: ' + body, duration_seconds: 31.4, num_turns: 0, usage: { input_tokens: 0, output_tokens: 0 } } })
   process.exit(1)
 }
 

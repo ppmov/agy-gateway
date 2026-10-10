@@ -192,14 +192,22 @@ export const Err = {
   BUSY: 'BUSY',
   /** Every pool account is cooling down or quota-empty for the family → 429. */
   POOL_EXHAUSTED: 'POOL_EXHAUSTED',
+  /** Upstream/relay unreachable on the eligibility probe (loadCodeAssist
+   *  transport failure: "Bad Gateway" 502, EOF / "unexpected EOF", 503
+   *  UNAVAILABLE). A ROUTE state — shared by every account behind the same
+   *  relay — NOT an account fault, so it must never quarantine the account.
+   *  Split from ELIGIBILITY_BLOCKED (the real geo/identity refusal) so a
+   *  relay blip cannot exile the whole pool. → 502 api_error. */
+  UPSTREAM_UNAVAILABLE: 'UPSTREAM_UNAVAILABLE',
   /** Upstream 403 re-validation (validation_url rides the message) → 403. */
   VALIDATION_REQUIRED: 'VALIDATION_REQUIRED',
-  /** Google eligibility/geo gate (Antigravity): 'Eligibility check failed …
-   *  loadCodeAssist', 'not eligible for Antigravity', 'User location is not
-   *  supported for the API use'. The credential is intact but the upstream
-   *  gate refuses to issue a session — classified distinctly from a generic
-   *  PROCESS_EXIT so the account is quarantined out of rotation instead of
-   *  being re-spawned blindly. → 403. */
+  /** Google eligibility/geo gate (Antigravity): 'not eligible for
+   *  Antigravity', 'not currently available in your location', 'User location
+   *  is not supported for the API use'. The credential is intact but the
+   *  upstream gate refuses to issue a session — classified distinctly from a
+   *  generic PROCESS_EXIT so the account is quarantined out of rotation instead
+   *  of being re-spawned blindly. A transport-only failure on the same probe
+   *  is NOT this class (see UPSTREAM_UNAVAILABLE). → 403. */
   ELIGIBILITY_BLOCKED: 'ELIGIBILITY_BLOCKED',
   /** Per-key model whitelist violation (M5) → 403, both protocol tables. */
   MODEL_NOT_ALLOWED: 'MODEL_NOT_ALLOWED',
@@ -385,17 +393,40 @@ export function looksLikeValidationRequired(text?: string): boolean {
 }
 
 /**
- * Google's eligibility / geo gate (Antigravity): the account cannot obtain a
- * session at all — `loadCodeAssist` fails ("Bad Gateway" / "Not Allowed"),
- * "not eligible for Antigravity", or "User location is not supported for the
- * API use". Distinct from AUTH (signed out) and VALIDATION_REQUIRED (challenge
- * pending): the credential is intact, the upstream gate refuses service.
+ * Google's eligibility / geo gate (Antigravity): the REAL identity/geo refusal
+ * — "not eligible for Antigravity", "…not currently available in your
+ * location", "User location is not supported for the API use". Distinct from
+ * AUTH (signed out) and VALIDATION_REQUIRED (challenge pending): the credential
+ * is intact, the upstream gate refuses service.
  * Deliberately narrow — the phrases are server-issued; a bare "not eligible"
- * is not enough (catalog code uses the word for account selection).
+ * is not enough (catalog code uses the word for account selection). The
+ * `Eligibility check failed:` prefix and `loadCodeAssist` are NOT signals of
+ * this class: agy stamps that prefix on EVERY eligibility-probe error,
+ * including pure transport failures (502/EOF/503) — those are split out into
+ * looksLikeTransientEligibilityTransport so a relay blip cannot quarantine the
+ * pool (t_a1cb54bc).
  */
 export function looksLikeEligibilityBlocked(text?: string): boolean {
   if (!text) return false
-  return /eligibility check failed|loadcodeassist|not eligible for antigravity|user location is not supported/i.test(text)
+  return /not eligible for antigravity|not currently available in your location|user location is not supported/i.test(text)
+}
+
+/**
+ * Transport-only failure of the eligibility PROBE (t_a1cb54bc): the relay /
+ * upstream is unreachable while agy checks `loadCodeAssist` — "Bad Gateway"
+ * 502, EOF / "unexpected EOF", 503 UNAVAILABLE, socket resets. This is a ROUTE
+ * state shared by every account behind the relay, NOT an account fault; the
+ * engine classifies it UPSTREAM_UNAVAILABLE and never touches account state.
+ * Deliberately narrow (canon: server-issued phrases): the transport token must
+ * ride the eligibility-probe CONTEXT — a bare `eof` / `bad gateway` on the
+ * GENERATION path belongs to the PROCESS_EXIT/retryable branch, so the
+ * conjunction probe && transport is required.
+ */
+export function looksLikeTransientEligibilityTransport(text?: string): boolean {
+  if (!text) return false
+  const probe = /eligibility check failed|loadcodeassist|fetchuserinfo|fetchavailablemodels/i.test(text)
+  const transport = /bad gateway|\beof\b|unexpected eof|connection timed out|timed out|socket hang up|econnreset|econnrefused|etimedout|unavailable \(code 503\)|service is currently unavailable|not allowed/i.test(text)
+  return probe && transport
 }
 
 /** Extract the https challenge URL from a VALIDATION_REQUIRED failure text. */

@@ -15,6 +15,7 @@ import { dirname, join } from 'node:path'
 import { stateDir } from '../common/config.ts'
 import {
   defaultPoolData,
+  isEligibilityQuarantined,
   modelFamilyOf,
   type AccountPoolData,
   type FamilyCooldownState,
@@ -42,6 +43,18 @@ const PERSIST_WARN_MS = 60_000
 export const ELIGIBILITY_QUARANTINE_THRESHOLD = 2
 /** A gap longer than this between eligibility failures restarts the streak. */
 export const ELIGIBILITY_STREAK_RESET_MS = 30 * 60 * 1000
+/**
+ * TTL of an eligibility/geo quarantine (t_a1cb54bc). The class only arms after
+ * repeated failures, but a REAL geo refusal used to be FOREVER (authRequired
+ * with no expiry), so a relay blip that flagged all accounts left the whole
+ * pool dead for hours while quotas were full. Even a genuine refusal must not
+ * block the pool forever: the window lapses and the account auto-recovers
+ * (lazy removal in selectAccount/getAccountHealth — see isEligibilityQuarantined).
+ * 10m: relay blips clear in minutes, and a real refusal re-arms the window at
+ * the cost of ≤1 probe spawn per account per window — an order of magnitude
+ * below the steady-state load, and only while the pool is otherwise empty.
+ */
+export const ELIGIBILITY_QUARANTINE_MS = 10 * 60 * 1000
 
 export class AccountPoolManager {
   private data: AccountPoolData
@@ -377,15 +390,22 @@ export class AccountPoolManager {
   recordEligibilityFailure(id: string, reason: string): boolean {
     const acc = this.getAccount(id)
     if (!acc) return false
+    // t_a1cb54bc: recover a lapsed window first, so a brand-new failure after
+    // expiry starts a fresh streak instead of instantly re-asserting a stale
+    // quarantine (the threshold then guards against a rapid re-arm).
+    this.eligibilityQuarantined(acc)
     const now = Date.now()
     const prev = acc.eligibilityFailures
     const streak =
       prev !== undefined && now - prev.lastAt <= ELIGIBILITY_STREAK_RESET_MS
         ? prev.consecutive + 1
         : 1
-    acc.eligibilityFailures = { consecutive: streak, lastAt: now }
     const alreadyQuarantined = acc.authRequired === true && acc.authError === reason
     if (streak >= ELIGIBILITY_QUARANTINE_THRESHOLD || acc.authRequired === true) {
+      // Arm (or re-assert) the quarantine WITH a TTL (t_a1cb54bc): even a real
+      // geo refusal must not block the pool forever — the account auto-recovers
+      // when the window lapses (eligibilityQuarantined / isEligibilityQuarantined).
+      acc.eligibilityFailures = { consecutive: streak, lastAt: now, until: now + ELIGIBILITY_QUARANTINE_MS }
       acc.authRequired = true
       acc.authError = reason
       if (this.data.activeAccountIds) {
@@ -394,13 +414,36 @@ export class AccountPoolManager {
         }
       }
       this.log?.(
-        `eligibility quarantine armed for account ${id} (streak ${streak}${alreadyQuarantined ? ', re-asserted' : ''}): ${reason}`,
+        `eligibility quarantine armed for account ${id} (streak ${streak}${alreadyQuarantined ? ', re-asserted' : ''}, window ${Math.round(ELIGIBILITY_QUARANTINE_MS / 60000)}m): ${reason}`,
       )
       this.persist()
       return true
     }
+    acc.eligibilityFailures = { consecutive: streak, lastAt: now }
     this.persistSoon()
     return false
+  }
+
+  /**
+   * Live eligibility-quarantine gate (t_a1cb54bc): true only while the account
+   * is quarantined AND its window is still open. When the window has lapsed the
+   * quarantine is removed lazily here (the same fields clearAuthRequired drops)
+   * so the account returns to rotation automatically — no operator action, no
+   * cron. A bare authRequired with no eligibility record (AUTH /
+   * VALIDATION_REQUIRED) is NOT this class and is left untouched.
+   */
+  private eligibilityQuarantined(acc: ManagedAccount): boolean {
+    if (!isEligibilityQuarantined(acc)) {
+      if (acc.authRequired === true && acc.eligibilityFailures?.until !== undefined) {
+        delete acc.authRequired
+        delete acc.authError
+        delete acc.eligibilityFailures
+        this.log?.(`eligibility quarantine window expired for account ${acc.id} — back in rotation`)
+        this.persistSoon()
+      }
+      return false
+    }
+    return true
   }
 
   markAuthRequired(id: string, reason?: string): void {
@@ -576,7 +619,7 @@ export class AccountPoolManager {
     const now = Date.now()
     const candidates = this.data.accounts.filter((acc) => {
       if (busy !== undefined && busy.has(acc.id)) return false
-      if (!acc.enabled || acc.authRequired) return false
+      if (!acc.enabled || this.eligibilityQuarantined(acc)) return false
       const cd = acc.cooldowns[family]
       if (cd && cd.cooldownUntil > now) return false
       // If 5h quota remaining is <= 2% and reset time is in future, treat as in cooldown
