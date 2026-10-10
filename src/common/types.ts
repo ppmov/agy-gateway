@@ -420,12 +420,15 @@ export function looksLikeEligibilityBlocked(text?: string): boolean {
  * Deliberately narrow (canon: server-issued phrases): the transport token must
  * ride the eligibility-probe CONTEXT — a bare `eof` / `bad gateway` on the
  * GENERATION path belongs to the PROCESS_EXIT/retryable branch, so the
- * conjunction probe && transport is required.
+ * conjunction probe && transport is required. Reachability: no branch is a
+ * substring of a sibling — `\beof\b` covers "unexpected EOF" and `timed out`
+ * covers "connection timed out", so neither is listed on its own (a shadowed
+ * alternative is dead code).
  */
 export function looksLikeTransientEligibilityTransport(text?: string): boolean {
   if (!text) return false
   const probe = /eligibility check failed|loadcodeassist|fetchuserinfo|fetchavailablemodels/i.test(text)
-  const transport = /bad gateway|\beof\b|unexpected eof|connection timed out|timed out|socket hang up|econnreset|econnrefused|etimedout|unavailable \(code 503\)|service is currently unavailable|not allowed/i.test(text)
+  const transport = /bad gateway|\beof\b|timed out|socket hang up|econnreset|econnrefused|etimedout|unavailable \(code 503\)|service is currently unavailable|not allowed/i.test(text)
   return probe && transport
 }
 
